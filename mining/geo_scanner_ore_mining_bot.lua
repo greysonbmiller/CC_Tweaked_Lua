@@ -679,10 +679,29 @@ end
 
 --- Returns true if this was a command from the owner. Anyone else on the server
 --- is ignored outright - otherwise any player could retask the bot.
+--- Returns true if this was a command from the owner. Anyone else on the server
+--- is ignored outright - otherwise any player could retask the bot.
+---
+--- Two deliberate leniencies, because the only symptom of getting either wrong
+--- is silence, which is indistinguishable from the bot being broken:
+---
+---   * The name is compared case-insensitively. Chat boxes have been seen
+---     reporting a different case than the player typed.
+---   * The prefix is optional. Some builds strip the hidden-message prefix
+---     before firing the event, leaving "ore 3" rather than "$ore 3".
+---
+--- The prefix still matters for one thing: WITH it, an unrecognised verb gets
+--- a reply, because you plainly meant to command the bot. WITHOUT it, an
+--- unrecognised verb is ignored in silence - otherwise every ordinary sentence
+--- the owner types would be answered back.
 local function handleCommand(who, message, send)
-    if who ~= PLAYER or type(message) ~= "string" then return false end
+    if type(who) ~= "string" or type(message) ~= "string" then return false end
+    if who:lower() ~= PLAYER:lower() then return false end
+
     local body = message:match("^%s*%" .. CHAT_PREFIX .. "(.*)$")
-    if not body then return false end
+    local prefixed = body ~= nil
+    if not body then body = message:match("^%s*(.-)%s*$") end
+    if not body or body == "" then return false end
 
     local verb, rest = body:match("^(%S+)%s*(.*)$")
     if not verb then return false end
@@ -692,9 +711,11 @@ local function handleCommand(who, message, send)
         listCatalogue(send)
     elseif verb == "ore" then
         if rest == "" then reportTargets(send) else selectOres(rest, send) end
-    else
+    elseif prefixed then
         send(string.format("I only understand %sore and %sores.",
                            CHAT_PREFIX, CHAT_PREFIX))
+    else
+        return false                       -- ordinary conversation; stay quiet
     end
     return true
 end
@@ -741,6 +762,11 @@ local function warpWindow(sent, hasPlate)
             if event == "timer" and a == deadline then
                 break
             elseif event == "chat" then
+                -- Printed unconditionally, before any filtering. If commands
+                -- are not working, this is the line that says whether the
+                -- event is arriving at all - which separates "the bot cannot
+                -- hear you" from "the bot heard you and rejected it".
+                print(string.format("chat [%s]: %s", tostring(a), tostring(b)))
                 handleCommand(a, b, send)
             end
         end

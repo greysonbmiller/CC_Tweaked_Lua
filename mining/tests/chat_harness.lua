@@ -157,6 +157,28 @@ assertThat("still processed the command", targets(r, REDSTONE), stateOf(r))
 assertThat("NOTHING dropped into the world", r.worldDrops == 0,
            "worldDrops=" .. r.worldDrops)
 
+-- 11. Chat boxes have been observed reporting names in a different case than
+--     the player typed. Being deaf over capitalisation is not acceptable when
+--     the only symptom is silence.
+print("\n[11] the username filter is case-insensitive")
+r = run(base({ { msg = "$ore 3", who = "skaaaal" } }))
+assertThat("obeyed the same player in lower case", targets(r, REDSTONE), stateOf(r))
+
+-- 12. Some builds strip the hidden-message prefix before firing the event, so
+--     the bot would see "ore 3" and match nothing. Accept both spellings.
+print("\n[12] a command still works with the $ stripped")
+r = run(base({ { msg = "ore 3" } }))
+assertThat("obeyed the bare command", targets(r, REDSTONE), stateOf(r))
+
+-- 13. The other half of [12]: accepting bare commands must NOT turn every
+--     sentence the owner types into a command, or the bot answers back at all
+--     ordinary conversation.
+print("\n[13] ordinary chat is not answered")
+r = run(base({ { msg = "hello there, nice weather" } }))
+assertThat("targets untouched", targets(r, LAPIS), stateOf(r))
+assertThat("did not reply to it",
+           not saidAny(r, "I only understand"), allSaid(r))
+
 print("\n" .. string.rep("=", 64))
 print(string.format("%d passed, %d failed", pass, fail))
 if fail > 0 then os.exit(1) end
