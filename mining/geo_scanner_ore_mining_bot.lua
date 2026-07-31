@@ -682,18 +682,25 @@ end
 --- Returns true if this was a command from the owner. Anyone else on the server
 --- is ignored outright - otherwise any player could retask the bot.
 ---
---- Two deliberate leniencies, because the only symptom of getting either wrong
---- is silence, which is indistinguishable from the bot being broken:
+--- The name is compared case-insensitively; being deaf over capitalisation is
+--- not a defensible failure when the only symptom is silence.
 ---
----   * The name is compared case-insensitively. Chat boxes have been seen
----     reporting a different case than the player typed.
----   * The prefix is optional. Some builds strip the hidden-message prefix
----     before firing the event, leaving "ore 3" rather than "$ore 3".
+--- THE PREFIX ARRIVES STRIPPED. You type "$ore 3", AdvancedPeripherals treats
+--- the $ as its hidden-message marker - which is what keeps the command out of
+--- public chat - and fires the event with just "ore 3". Confirmed with
+--- chat_box_probe.lua. So the prefix cannot be required, and equally cannot be
+--- used to tell a command from conversation, because it is never there.
 ---
---- The prefix still matters for one thing: WITH it, an unrecognised verb gets
---- a reply, because you plainly meant to command the bot. WITHOUT it, an
---- unrecognised verb is ignored in silence - otherwise every ordinary sentence
---- the owner types would be answered back.
+--- Commands are recognised by SHAPE instead. "ore 3" and "ore 99" are commands
+--- because the first argument looks like a pick; "ore is the best" is not, and
+--- is ignored in silence. That distinction matters in both directions: without
+--- it the bot either answers back at ordinary conversation, or - worse - goes
+--- quiet on a mistyped pick number, which is exactly when you need to be told.
+local function looksLikePick(token)
+    return token ~= nil
+       and (tonumber(token) ~= nil or token:find(":", 1, true) ~= nil)
+end
+
 local function handleCommand(who, message, send)
     if type(who) ~= "string" or type(message) ~= "string" then return false end
     if who:lower() ~= PLAYER:lower() then return false end
@@ -708,9 +715,17 @@ local function handleCommand(who, message, send)
     verb = verb:lower()
 
     if verb == "ores" then
+        -- Bare "ores" is a command; "ores are great" is a sentence.
+        if rest ~= "" and not prefixed then return false end
         listCatalogue(send)
     elseif verb == "ore" then
-        if rest == "" then reportTargets(send) else selectOres(rest, send) end
+        if rest == "" then
+            reportTargets(send)
+        elseif prefixed or looksLikePick(rest:match("^([^%s,]+)")) then
+            selectOres(rest, send)
+        else
+            return false
+        end
     elseif prefixed then
         send(string.format("I only understand %sore and %sores.",
                            CHAT_PREFIX, CHAT_PREFIX))

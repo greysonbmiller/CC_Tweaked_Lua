@@ -179,6 +179,25 @@ assertThat("targets untouched", targets(r, LAPIS), stateOf(r))
 assertThat("did not reply to it",
            not saidAny(r, "I only understand"), allSaid(r))
 
+-- 14. CONFIRMED BY PROBE: AdvancedPeripherals strips the $ before firing the
+--     event, so every real command arrives bare. That means the prefix cannot
+--     be used to tell a command from conversation - and in particular, a
+--     mistyped pick number must STILL be reported, because that is precisely
+--     when silence is most misleading.
+print("\n[14] a bad pick number is reported even with no prefix")
+r = run(base({ { msg = "ore 99" } }))
+assertThat("targets untouched", targets(r, LAPIS), stateOf(r))
+assertThat("told the operator about 99", saidAny(r, "99"), allSaid(r))
+
+-- 15. The other side of [14]: sentences that merely begin with the word must
+--     not trigger anything, or the bot talks over ordinary conversation.
+print("\n[15] sentences beginning 'ore'/'ores' are ignored")
+r = run(base({ { msg = "ores are great in this pack" } }))
+assertThat("did not list the catalogue", not saidAny(r, REDSTONE), allSaid(r))
+r = run(base({ { msg = "ore is the best thing to mine" } }))
+assertThat("targets untouched", targets(r, LAPIS), stateOf(r))
+assertThat("stayed quiet", not saidAny(r, "I do not know"), allSaid(r))
+
 print("\n" .. string.rep("=", 64))
 print(string.format("%d passed, %d failed", pass, fail))
 if fail > 0 then os.exit(1) end
