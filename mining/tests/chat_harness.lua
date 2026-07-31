@@ -131,7 +131,10 @@ assertThat("advertised the command", saidAny(r, "$ore"), allSaid(r))
 --    REPEATEDLY: it cannot place a plate it never picked up again.
 print("\n[9] the window ends by itself, cycle after cycle")
 r = run(base({ { msg = "$ore 3" } }))
-assertThat("plate was placed", r.platePlaced)
+-- The window must NOT depend on a plate going down. It used to live inside the
+-- successful-warp path, so disabling warp plates would have silently disabled
+-- the only way to retarget the bot along with them.
+assertThat("no plate placed, and the window ran anyway", not r.platePlaced)
 assertThat("window closed and mining resumed", saidAny(r, "resumed"), allSaid(r))
 local resumes = 0
 for _, m in ipairs(r.sent) do

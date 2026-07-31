@@ -121,6 +121,30 @@ local SLOT = {
 }
 local LOOT_FIRST, LOOT_LAST = 1, 9
 
+-- WARP PLATES ARE DISABLED. Do not turn this on without reading why.
+--
+-- Waystones' WaystoneBlockBase.setPlacedBy() syncs waystone data to whoever
+-- placed the block. A turtle acts through a fake player that carries the owner's
+-- identity but has NO network connection, so the channel lookup dereferences
+-- null and throws inside the server tick. That does not kill the turtle - it
+-- kills THE SERVER:
+--
+--   TurtlePlaceCommand.doDeployOnBlock -> BlockItem.place
+--     -> WaystoneBlockBase.setPlacedBy -> WaystoneSyncManager.sendWaystoneGroups
+--       -> BalmNetworking.sendTo -> NetworkRegistry.hasChannel
+--         -> ChannelAttributes.getPayloadSetup   *** crash ***
+--
+-- startup.lua then relaunches this program on boot, so the world crashes again
+-- the moment the turtle ticks - an unrecoverable loop that has to be broken by
+-- deleting startup.lua from the save on disk.
+--
+-- Observed on Waystones 21.1.37 / Balm 21.0.63 / NeoForge 21.1.241 / MC 1.21.1
+-- with CC:Tweaked 1.120.0. It worked on an older combination, so it is a
+-- regression in that stack rather than anything inherent - but until it is
+-- confirmed fixed, THE BOT MUST NOT PLACE A PLATE. Placing one costs the whole
+-- server; not placing one costs only the rescue mechanism.
+local WARP_PLATE_ENABLED = false
+
 local PICKAXE = "minecraft:diamond_pickaxe"
 local SCANNER = "advancedperipherals:geo_scanner"
 local ENDER   = "enderstorage:ender_chest"
@@ -431,6 +455,7 @@ end
 --- announcing and their own hold, because the normal cycle wants the plate back
 --- afterwards and a distress call does not.
 local function deployWarpPoint()
+    if not WARP_PLATE_ENABLED then return nil, false end
     if turtle.getItemCount(SLOT.plate) == 0 then return nil, false end
 
     turtle.select(1)

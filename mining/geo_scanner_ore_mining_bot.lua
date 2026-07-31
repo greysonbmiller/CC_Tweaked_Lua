@@ -58,6 +58,34 @@ local DEFAULT_TARGETS = {
 -- possibly get to it. warpPlate() runs every 4th cycle (see the main loop).
 local WARP_HOLD_SECONDS = 30
 
+-- WARP PLATES ARE DISABLED. Do not turn this on without reading why.
+--
+-- Waystones' WaystoneBlockBase.setPlacedBy() syncs waystone data to whoever
+-- placed the block. A turtle acts through a fake player that carries the owner's
+-- identity but has NO network connection, so the channel lookup dereferences
+-- null and throws inside the server tick. That does not kill the turtle - it
+-- kills THE SERVER:
+--
+--   TurtlePlaceCommand.doDeployOnBlock -> BlockItem.place
+--     -> WaystoneBlockBase.setPlacedBy -> WaystoneSyncManager.sendWaystoneGroups
+--       -> BalmNetworking.sendTo -> NetworkRegistry.hasChannel
+--         -> ChannelAttributes.getPayloadSetup   *** crash ***
+--
+-- And because startup.lua relaunches this program on boot, the world crashes
+-- again the moment the turtle ticks: an unrecoverable crash loop that has to be
+-- broken by deleting startup.lua from the save on disk.
+--
+-- Observed on Waystones 21.1.37 / Balm 21.0.63 / NeoForge 21.1.241 / MC 1.21.1
+-- with CC:Tweaked 1.120.0. It worked on an older combination, so it is a
+-- regression somewhere in that stack rather than anything inherent - but until
+-- it is confirmed fixed, THE BOT MUST NOT PLACE A PLATE. Placing one costs the
+-- whole server; not placing one costs only the rescue mechanism.
+--
+-- The cost is real and worth stating plainly: with this off, a bot that halts
+-- in the field cannot be reached. distress() now says so honestly instead of
+-- promising a rescue it cannot deliver.
+local WARP_PLATE_ENABLED = false
+
 -- Staging map: what the turtle pulls out of the chest in front of it, and which
 -- slot each thing goes to. Keys are matched against an item's display name
 -- first, then its item id, then its NBT hash.
@@ -666,10 +694,15 @@ local function handleCommand(who, message, send)
     return true
 end
 
-local function announceWindow(send, sent)
-    send(string.format("Warp plate is down%s - %d seconds to collect me. Mining: %s.",
-                       sent and " and the warp stone is on its way to you" or "",
-                       WARP_HOLD_SECONDS, targetSummary()))
+local function announceWindow(send, sent, hasPlate)
+    if hasPlate then
+        send(string.format("Warp plate is down%s - %d seconds to collect me. Mining: %s.",
+                           sent and " and the warp stone is on its way to you" or "",
+                           WARP_HOLD_SECONDS, targetSummary()))
+    else
+        send(string.format("Listening for %d seconds. Mining: %s.",
+                           WARP_HOLD_SECONDS, targetSummary()))
+    end
     if not ANNOUNCE_MENU then return end
 
     -- What is in reach of where the bot is standing, which is the set actually
@@ -694,9 +727,9 @@ end
 --- timer, and os.pullEvent(filter) discards everything that does not match, so
 --- every chat message arriving during the hold would be pulled off the queue
 --- and thrown away. The window would look right and hear nothing.
-local function warpWindow(sent)
+local function warpWindow(sent, hasPlate)
     local listened = withChatBox(function(send)
-        announceWindow(send, sent)
+        announceWindow(send, sent, hasPlate)
         local deadline = os.startTimer(WARP_HOLD_SECONDS)
         while true do
             local event, a, b = os.pullEvent()
@@ -801,6 +834,7 @@ end
 --- announcing and their own hold, because the normal cycle wants the plate back
 --- afterwards and a distress call does not.
 local function deployWarpPoint()
+    if not WARP_PLATE_ENABLED then return nil, false end
     if turtle.getItemCount(SLOT.plate) == 0 then return nil, false end
 
     turtle.select(1)
@@ -1000,21 +1034,15 @@ local function warpPlate()
 
     local plateFace, sent = deployWarpPoint()
 
-    if not plateFace then
-        -- Not fatal on the scheduled path: the bot is healthy and will offer
-        -- another warp point in four cycles. Say so and carry on rather than
-        -- stopping a working bot over one blocked position.
-        print("Could not place the warp plate here; skipping this warp window.")
-        pcall(chat, "Could not put a warp plate down here - I will try again next cycle.")
-        setPhase("mining")
-        return
-    end
-
+    -- The listening window runs whether or not a plate went down. It used to be
+    -- inside the success path, which meant that disabling warp plates silently
+    -- disabled the only chance to retarget the bot as well - a config flag on
+    -- one feature quietly switching off an unrelated one.
     print("pausing functionality - listening for commands")
-    warpWindow(sent)
+    warpWindow(sent, plateFace ~= nil)
     print("resuming functionality")
 
-    recoverWarpPlate(plateFace)
+    if plateFace then recoverWarpPlate(plateFace) end
     setPhase("mining")
 end
 

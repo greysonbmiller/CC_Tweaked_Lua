@@ -103,31 +103,31 @@ assertThat("stopped rather than continuing", not r.ok)
 -- 6. THE ONE THAT MATTERS FOR "COME AND GET ME". A field failure must leave a
 --    warp plate ON THE GROUND and send the warp stone home, otherwise the
 --    message is telling you to walk to a place you cannot reach.
-print("\n[6] field failure must leave a usable warp point")
+--    WARP PLATES ARE DISABLED. Placing one calls Waystones' setPlacedBy, which
+--    syncs to a fake player with no network connection and takes the whole
+--    SERVER down - then startup.lua relaunches this program on boot and it
+--    happens again, which is an unrecoverable crash loop. So the assertion is
+--    inverted from what it once was: a field failure must halt WITHOUT placing
+--    anything, and must say plainly that it cannot be reached.
+print("\n[6] field failure halts without placing a plate")
 local kitNoRefuel = fullKit(); kitNoRefuel[16] = nil   -- incomplete kit on restart
--- Stand in for the activated warp stone the hopper would have picked up: it has
--- to reach the warp chest, or you have a plate you cannot warp to.
 kitNoRefuel[1] = { name = "waystones:warp_stone", count = 1 }
 r = run{ preInv = kitNoRefuel, preFiles = { ["state.txt"] = st },
          frontChest = nil, budget = 3000 }
 assertThat("halted", not r.ok)
-assertThat("a warp plate was placed", r.platePlaced)
-assertThat("plate LEFT in the world, not picked back up",
-           r.world.front == PLATE or r.world.down == PLATE,
+assertThat("NO plate placed", not r.platePlaced)
+assertThat("nothing left in the world", r.world.front ~= PLATE and r.world.down ~= PLATE,
            "front=" .. tostring(r.world.front) .. " down=" .. tostring(r.world.down))
-assertThat("warp stone sent home (something reached a chest)", r.safeDrops > 0,
-           "safeDrops=" .. r.safeDrops)
 assertThat("NOTHING dropped into the world", r.worldDrops == 0,
            "worldDrops=" .. r.worldDrops)
 
--- 7. Refuel failure is the classic stranding case: it must also leave a plate.
-print("\n[7] refuel takes on nothing -> must still leave a warp point")
+-- 7. Refuel failure is the classic stranding case. It must still halt safely,
+--    and still must not place anything.
+print("\n[7] refuel takes on nothing -> halts without placing")
 r = run{ preInv = fullKit(), preFiles = { ["state.txt"] = st },
          frontChest = nil, fuelRises = false, budget = 3000 }
 assertThat("halted", not r.ok)
-assertThat("a warp plate was placed", r.platePlaced)
-assertThat("plate LEFT in the world", r.world.front == PLATE or r.world.down == PLATE,
-           "front=" .. tostring(r.world.front) .. " down=" .. tostring(r.world.down))
+assertThat("NO plate placed", not r.platePlaced)
 assertThat("NOTHING dropped into the world", r.worldDrops == 0,
            "worldDrops=" .. r.worldDrops)
 
@@ -162,13 +162,18 @@ assertThat("NOTHING dropped into the world", r.worldDrops == 0,
            "worldDrops=" .. r.worldDrops)
 
 -- 11. RISK 1c: state file DELETED outright while deployed. The parse check
---     cannot catch this, so the carried kit is what has to give it away - and
---     the bot must leave a warp point rather than just shrugging.
+--     cannot catch this, so the carried kit is what has to give it away. It must
+--     still be recognised as a field failure and halt - but WITHOUT placing.
+--
+--     This is the case that turned the crash into a loop: a bot with no state
+--     file but a full kit takes the distress path, which used to place a plate,
+--     which crashes the server on every single world load. Deleting state.txt to
+--     "reset" a crash-looping turtle made it strictly worse.
 print("\n[11] state file lost entirely while deployed")
 r = run{ preInv = fullKit(), preFiles = {}, frontChest = nil, budget = 3000 }
 assertThat("halted", not r.ok)
-assertThat("a warp plate was placed", r.platePlaced)
-assertThat("plate LEFT in the world", r.world.front == PLATE or r.world.down == PLATE,
+assertThat("NO plate placed", not r.platePlaced)
+assertThat("nothing left in the world", r.world.front ~= PLATE and r.world.down ~= PLATE,
            "front=" .. tostring(r.world.front) .. " down=" .. tostring(r.world.down))
 assertThat("NOTHING dropped into the world", r.worldDrops == 0,
            "worldDrops=" .. r.worldDrops)
@@ -214,6 +219,51 @@ assertThat("named slot 16 specifically",
            (r.err or ""):find("slot 16 (refuel ender chest)", 1, true) ~= nil, r.err)
 assertThat("NOTHING dropped into the world", r.worldDrops == 0,
            "worldDrops=" .. r.worldDrops)
+
+-- 15. THE SERVER-SAFETY INVARIANT.
+--
+--     Placing a warp plate calls Waystones' setPlacedBy, which syncs to the
+--     placing player. A turtle's fake player has no network connection, so the
+--     channel lookup throws inside the server tick and takes the SERVER down -
+--     not the turtle. startup.lua then relaunches the program on boot and it
+--     happens again: a crash loop that can only be broken by deleting
+--     startup.lua from the save on disk, which on a hosted server means finding
+--     someone with file access.
+--
+--     So this is not "a feature is off". It is "this program must never place
+--     that block", checked across every scenario rather than trusted to a
+--     constant nobody re-reads.
+print("\n[15] no scenario may EVER place a warp plate")
+local everPlaced, placedIn = false, nil
+local scenarios = {
+    { name = "first run at base", opts = function()
+        local s = {}
+        for _, it in pairs(fullKit()) do s[#s + 1] = it end
+        s[#s + 1] = { name = PICKAXE, count = 1 }
+        return { preInv = {}, preFiles = {}, frontChest = s, budget = 3000 }
+    end },
+    { name = "healthy field restart", opts = function()
+        return { preInv = fullKit(), preFiles = { ["state.txt"] = st },
+                 frontChest = nil, budget = 3000 }
+    end },
+    { name = "refuel failure", opts = function()
+        return { preInv = fullKit(), preFiles = { ["state.txt"] = st },
+                 frontChest = nil, fuelRises = false, budget = 3000 }
+    end },
+    { name = "state file lost", opts = function()
+        return { preInv = fullKit(), preFiles = {}, frontChest = nil, budget = 3000 }
+    end },
+    { name = "corrupt state file", opts = function()
+        return { preInv = fullKit(), preFiles = { ["state.txt"] = '{["deploy' },
+                 frontChest = nil, budget = 3000 }
+    end },
+}
+for _, sc in ipairs(scenarios) do
+    local rep = run(sc.opts())
+    if rep.platePlaced then everPlaced, placedIn = true, sc.name end
+end
+assertThat("no warp plate placed in any scenario", not everPlaced,
+           "placed during: " .. tostring(placedIn))
 
 print("\n" .. string.rep("=", 64))
 print(string.format("%d passed, %d failed", pass, fail))
