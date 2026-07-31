@@ -595,8 +595,6 @@ end
 local CHAT_PREFIX = "$"        -- AdvancedPeripherals' hidden-message prefix:
                                -- these reach chat boxes without appearing in
                                -- public chat.
-local LIST_PER_MESSAGE = 4     -- full ids are long; four is about a chat line.
-
 -- Whether the announce spells out the pick list every window. Three lines every
 -- fourth cycle adds up if you are not using it; set false for the single line.
 local ANNOUNCE_MENU = true
@@ -614,18 +612,17 @@ local function resolvePick(token)
     return nil, false
 end
 
+--- One ore per chat line. Packing several onto a line saved messages but made
+--- the list unreadable in the chat window, and reading a number off it wrongly
+--- is the mistake this whole catalogue exists to prevent.
 local function listCatalogue(send)
     if #catalogue == 0 then
         send("I have not catalogued any ores yet - I write them down as I scan them.")
         return
     end
-    local line = {}
+    send(string.format("%d ores scanned so far:", #catalogue))
     for i, id in ipairs(catalogue) do
-        line[#line + 1] = string.format("%d %s", i, id)
-        if #line == LIST_PER_MESSAGE or i == #catalogue then
-            send(table.concat(line, "  |  "))
-            line = {}
-        end
+        send(string.format("%d  %s", i, id))
     end
     send(string.format("Pick with %sore <numbers>, e.g. %sore 1 3",
                        CHAT_PREFIX, CHAT_PREFIX))

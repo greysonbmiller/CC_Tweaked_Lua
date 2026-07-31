@@ -118,6 +118,17 @@ print("\n[7] $ores lists the catalogue with pick numbers")
 r = run(base({ { msg = "$ores" } }))
 assertThat("listed redstone", saidAny(r, REDSTONE), allSaid(r))
 assertThat("listed diamond", saidAny(r, DIAMOND), allSaid(r))
+-- One ore per line. Packing several onto a line saves messages but makes the
+-- list unreadable in chat, and misreading a number off it is exactly the
+-- mistake the catalogue exists to prevent.
+local crowded = nil
+for _, m in ipairs(r.sent) do
+    local n = 0
+    for _ in tostring(m.msg):gmatch("[%w_%-%.]+:[%w_%-%./]+") do n = n + 1 end
+    if n > 1 then crowded = tostring(m.msg) end
+end
+assertThat("no message carries more than one ore", crowded == nil,
+           "crowded line: " .. tostring(crowded))
 
 -- 8. The announce has to carry what you need to act, at the moment you can act.
 print("\n[8] the announce states the target and how to change it")
