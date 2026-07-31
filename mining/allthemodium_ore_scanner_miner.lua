@@ -147,6 +147,13 @@ local WARP_PLATE_ENABLED = false
 
 -- How long withContainer waits for a just-placed container to show up as a
 -- peripheral before believing it is not one. Five quarter-second retries.
+-- How hard to dig at one block before deciding it is not going to move. A
+-- gravel or sand column falls one block per dig; bedrock stops the loop on the
+-- first refusal regardless, so this only bounds the falling-block case.
+local DIG_ATTEMPTS  = 16
+local DIG_SETTLE    = 0.35   -- let a falling block actually land before re-digging
+local MOVE_ATTEMPTS = 4      -- per step: covers gravel still settling, or a mob
+
 local WRAP_RETRIES     = 5
 local WRAP_RETRY_SLEEP = 0.25
 
@@ -277,14 +284,39 @@ end
 -- lets one piece of code try front, then up, then down without three copies of
 -- itself - which is what makes the "somewhere else worked" fallback cheap.
 local FACE = {
-    front = { dig = turtle.dig,     place = turtle.place,
+    front = { dig = turtle.dig,     place = turtle.place,     detect = turtle.detect,
               inspect = turtle.inspect,     suck = turtle.suck,     drop = turtle.drop     },
-    up    = { dig = turtle.digUp,   place = turtle.placeUp,
+    up    = { dig = turtle.digUp,   place = turtle.placeUp,   detect = turtle.detectUp,
               inspect = turtle.inspectUp,   suck = turtle.suckUp,   drop = turtle.dropUp   },
-    down  = { dig = turtle.digDown, place = turtle.placeDown,
+    down  = { dig = turtle.digDown, place = turtle.placeDown, detect = turtle.detectDown,
               inspect = turtle.inspectDown, suck = turtle.suckDown, drop = turtle.dropDown },
 }
 local FACE_ORDER = { "front", "up", "down" }
+
+--- Dig until the way is ACTUALLY clear, not just dug once.
+---
+--- GRAVEL AND SAND FALL. One dig() removes one block; the column above then
+--- drops straight into the hole that was just made, so the space is occupied
+--- again before the turtle can move into it. A single dig is correct for stone
+--- and wrong for any falling block, and the failure is invisible from outside:
+--- forward() simply returns false, which the old move() discarded - silently
+--- eating a block of travel and leaving the turtle offset from where seek()
+--- believed it had sent it.
+---
+--- Retries are bounded: a genuinely unbreakable block would otherwise spin here
+--- forever. dig() returning false while something is still detected means
+--- exactly that, so stop immediately.
+local function clear(detect, dig)
+    if not detect() then return true end
+    for _ = 1, DIG_ATTEMPTS do
+        if not dig() then return false end   -- cannot be broken at all
+        if not detect() then return true end
+        -- A falling block needs a tick or two to land before the next dig can
+        -- see it; digging instantly just hits air and reports success.
+        os.sleep(DIG_SETTLE)
+    end
+    return not detect()
+end
 
 
 ----------------------------------------------------------------------------
@@ -415,7 +447,11 @@ local function withContainer(slot, action, faces)
 
     for _, face in ipairs(faces) do
         local f = FACE[face]
-        f.dig()                       -- best effort; failure is fine
+        -- Best effort, but gravel-aware: a single dig into a gravel column
+        -- clears one block and lets the next fall in, so place() finds the face
+        -- still occupied and this reports "could not place on any face" at a
+        -- turtle standing in an open cave. See clear().
+        clear(f.detect, f.dig)
         turtle.select(slot)
         if f.place() then
             notePlaced(slot, face)
@@ -599,18 +635,47 @@ end
 -- the ME system, so this is instant and works from any distance or dimension -
 -- and breaking the block afterwards loses nothing, because the items were never
 -- in the block to begin with.
+-- Has the deposit chest been refusing loot? Remembered so the warning is said
+-- once when it starts and once when it clears, rather than every single cycle.
+local depositFull = false
+
 local function deposit()
     digReady()
     setPhase("depositing")
+    local stuck = 0
     local ok = withContainer(SLOT.deposit, function(f)
         for i = LOOT_FIRST, LOOT_LAST do
             if turtle.getItemCount(i) > 0 then
                 turtle.select(i)
                 f.drop()
+                -- drop() returns TRUE on a partial transfer, so its return
+                -- value cannot answer "did this slot go home". The count can.
+                if turtle.getItemCount(i) > 0 then stuck = stuck + 1 end
             end
         end
         return true
     end)
+
+    -- THE CHEST CAN FILL UP. It is an ender chest drained into the ME system at
+    -- home; if that drain stalls the chest backs up and every drop above fails
+    -- silently. The old code ignored the return, so the bot carried on mining
+    -- with nine full loot slots, picking up nothing it broke, for as long as it
+    -- had fuel - no error, no message, no loot.
+    --
+    -- Deliberately NOT distress(): that halts the run permanently, and a backed
+    -- up ME system is usually temporary. Say so, keep mining, and let the next
+    -- cycle deliver the backlog once the chest drains.
+    if stuck > 0 and not depositFull then
+        depositFull = true
+        pcall(chat, string.format(
+            "DEPOSIT CHEST IS FULL - %d stack%s would not fit and is still aboard. " ..
+            "The ME system at home has probably stopped draining it. I will keep " ..
+            "mining and retry every cycle.", stuck, stuck == 1 and "" or "s"))
+    elseif stuck == 0 and depositFull then
+        depositFull = false
+        pcall(chat, "Deposit chest is taking items again - backlog sent home.")
+    end
+
     if not ok then
         distress("Could not place the deposit chest on any face.",
                  "Holding the loot rather than throwing it away.")
@@ -666,12 +731,28 @@ local function refuel()
     setPhase("mining")
 end
 
+--- Walk `distance` blocks forward, digging a 2x1 corridor, and report how far
+--- it actually got.
+---
+--- The old version dug once, moved once, and threw away every return value. A
+--- gravel fall (see clear()), a mob in the way, or an empty fuel tank all read
+--- as "moved" when nothing had moved at all.
 local function move(distance)
+    local moved = 0
     for _ = 1, distance do
-        turtle.dig()
-        turtle.digUp()
-        turtle.forward()
+        local stepped = false
+        for _ = 1, MOVE_ATTEMPTS do
+            clear(turtle.detect,   turtle.dig)
+            clear(turtle.detectUp, turtle.digUp)   -- keep the corridor 2 high
+            if turtle.forward() then stepped = true break end
+            -- Not gravel, then: a mob that will wander off, or fuel that is
+            -- gone. Either way one short wait is worth it before giving up.
+            os.sleep(DIG_SETTLE)
+        end
+        if not stepped then break end
+        moved = moved + 1
     end
+    return moved
 end
 
 -- Called from seek(), at every allthemodium ore the bot reaches - see the note
@@ -912,19 +993,23 @@ local function seek(x,y,z)
     -- safety, and quietly changing the navigation maths mid-refactor would make
     -- any behaviour change impossible to attribute. Worth fixing on purpose,
     -- separately, once someone can watch it dig.
+    -- Gravel safety only below. The y arithmetic above, quirk included, is
+    -- untouched on purpose: this pass is about digging through falling blocks,
+    -- and changing the navigation maths in the same edit would make any
+    -- behaviour change impossible to attribute.
     if y > 0 then
         y = y - 1
         for _ = 1, math.abs(y) do
-            turtle.digUp()
-            turtle.dig() --accessibility 2x1
-            turtle.up()
+            if not clear(turtle.detectUp, turtle.digUp) then break end
+            clear(turtle.detect, turtle.dig) --accessibility 2x1
+            if not turtle.up() then break end
         end
     elseif y < 0 then
         y = 1 + 1
         for _ = 1, math.abs(y) do
-            turtle.digDown()
-            turtle.dig() --accessibility 2x1
-            turtle.down()
+            if not clear(turtle.detectDown, turtle.digDown) then break end
+            clear(turtle.detect, turtle.dig) --accessibility 2x1
+            if not turtle.down() then break end
         end
     end
     -- The allthemodium patch: offer a warp point at every ore, not on a timer.

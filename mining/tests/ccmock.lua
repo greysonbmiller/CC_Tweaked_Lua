@@ -321,6 +321,15 @@ function M.makeEnv(opts)
     turtle.inspect     = function() return inspectFace("front") end
     turtle.inspectUp   = function() return inspectFace("up")    end
     turtle.inspectDown = function() return inspectFace("down")  end
+    -- detect() answers "is there a block there", which is how the bot tells a
+    -- cleared space from one that a falling gravel column has just refilled.
+    -- Only placed blocks exist in this world model, so an untouched face is
+    -- air - which is the right default: it makes clear() a no-op everywhere a
+    -- test has not deliberately put something in the way.
+    local function detectFace(face) return world[face] ~= nil end
+    turtle.detect     = function() return detectFace("front") end
+    turtle.detectUp   = function() return detectFace("up")    end
+    turtle.detectDown = function() return detectFace("down")  end
     turtle.forward = function() tick() return burn() end
     -- ups/downs exist so a test can prove the bot actually went for an ore.
     -- seek() is the only thing that moves vertically by more than it comes
