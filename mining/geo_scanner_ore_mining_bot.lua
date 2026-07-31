@@ -104,10 +104,16 @@ local SCAN_RETRY_SLEEP = 0.25
 -- the walking.
 local FUEL_RESERVE = 500
 
--- Keep this many wide scans' worth of fuel in the tank above the reserve. Four
--- cycles is the gap between scheduled refuels, so this is what it takes to
--- reach the next one without running dry.
-local FUEL_SCANS_IN_HAND = 4
+-- Keep this many wide scans' worth of fuel in the tank above the reserve, and
+-- top up by the same again.
+--
+-- Not more. A refuel draws one lava bucket at a time - 1000 fuel - and is
+-- bounded at 32 draws, so a target above ~32000 can never be reached and the
+-- bot refuels every single cycle without ever being satisfied. Measured on an
+-- earlier, greedier setting: 3 refuels per run at radius 8 but 74 at radius 16,
+-- which from outside looks like a turtle that has stopped mining and started
+-- fiddling with chests.
+local FUEL_SCANS_IN_HAND = 2
 
 -- WARP PLATES ARE DISABLED. Do not turn this on without reading why.
 --
@@ -1183,9 +1189,11 @@ local function refuel()
     setPhase("refueling")
     local before = turtle.getFuelLevel()
 
-    -- Top up to twice the floor, so the bot leaves with headroom rather than
-    -- sitting exactly on the line and refuelling again next cycle.
-    local target = fuelFloor() * 2
+    -- Leave with headroom above the floor, but only as much as a refuel can
+    -- actually deliver: 32 draws of one lava bucket is 32000, so a target above
+    -- that is never reached and the bot refuels every cycle forever.
+    local target = fuelFloor() + (costOf(state.radius) * FUEL_SCANS_IN_HAND)
+    target = math.min(target, 30000)
     local limit = turtle.getFuelLimit()
     if type(limit) == "number" and limit > 0 then
         target = math.min(target, math.floor(limit * 0.9))
@@ -1548,8 +1556,11 @@ local function scan_and_search(radius)
 
     local closest_block = 99999
     local closest_x, closest_y, closest_z, closest_name
+    local seen, matched = 0, 0
     for _, item_data in pairs(scan_data) do
+        seen = seen + 1
         if TARGETS[item_data.name] then
+            matched = matched + 1
             local block_distance = calcDist(item_data.x, item_data.y, item_data.z)
             if block_distance < closest_block then
                 closest_block = block_distance
@@ -1560,6 +1571,12 @@ local function scan_and_search(radius)
             end
         end
     end
+
+    -- The line that tells "the scanner returned nothing" apart from "it
+    -- returned plenty and none of it is what we are looking for". Those need
+    -- opposite fixes and look identical from outside the turtle.
+    print(string.format("r=%d: %d blocks, %d match", radius, seen, matched))
+
     if closest_block < 999 then
         seek(closest_x, closest_y, closest_z)
         return closest_name
