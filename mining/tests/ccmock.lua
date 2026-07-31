@@ -214,6 +214,9 @@ function M.makeEnv(opts)
             elseif leftTool == CHATBOX then
                 return { sendMessageToPlayer = function(msg, who)
                     report.sent[#report.sent + 1] = { msg = msg, who = who }
+                    -- Models the chat box refusing when the recipient is not
+                    -- logged in, which for an unattended bot is most of the time.
+                    if opts.sendFails then error("player not found", 0) end
                     return true
                 end }
             end
@@ -314,8 +317,11 @@ function M.makeEnv(opts)
                 local c = table.remove(pending, 1)
                 return "chat", c.who or opts.player or "SKAAAAL", c.msg, "uuid", true
             end
+            -- Once the queue drains, keep handing back the most recent timer id
+            -- so a listening loop always eventually sees its own deadline. A
+            -- zero here would spin forever instead.
             local t = table.remove(liveTimers, 1)
-            return "timer", t or 0
+            return "timer", t or nextTimer
         end,
         time = function() return 0 end,
         clock = os.clock,

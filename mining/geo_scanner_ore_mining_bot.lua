@@ -280,7 +280,13 @@ end
 -- must never be reordered or removed - a number written down during one warp
 -- window has to still mean the same ore at the next one.
 local catalogue = {}          -- ordered ids, index = pick number
-local catalogueSet = {}       -- id -> true, for O(1) "have I seen this?"
+local catalogueSet = {}       -- id -> its pick number, for O(1) lookups
+
+-- The most recent scan result, kept so the warp-window announce can say what is
+-- visible without swapping the scanner back onto the arm. During the window the
+-- chat box is equipped, and swapping it off to scan would drop any message sent
+-- in the meantime.
+local lastScan = {}
 
 -- Pull the id out of a catalogue line, whatever else is on it. Matching the
 -- namespaced token rather than the whole line means the file can carry pick
@@ -309,8 +315,8 @@ local function loadCatalogue()
     for line in raw:gmatch("[^\r\n]+") do
         local id = idFromLine(line)
         if id and not catalogueSet[id] then
-            catalogueSet[id] = true
             catalogue[#catalogue + 1] = id
+            catalogueSet[id] = #catalogue
         end
     end
 end
@@ -342,13 +348,49 @@ local function recordScan(scan_data)
         local name = b.name
         if type(name) == "string" and not catalogueSet[name] and looksLikeOre(name) then
             if #catalogue >= ORE_LIMIT then break end
-            catalogueSet[name] = true
             catalogue[#catalogue + 1] = name
+            catalogueSet[name] = #catalogue
             grew = true
         end
     end
     if grew then saveCatalogue() end
     return grew
+end
+
+-- "minecraft:deepslate_lapis_ore" -> "deepslate_lapis_ore". Chat lines are
+-- short and the namespace is the same for every entry in a listing, so it is
+-- noise; the full id is still what gets stored and matched.
+local function shortName(id)
+    return (id:match(":(.+)$") or id)
+end
+
+--- What the bot is currently mining, as a chat-length phrase.
+local function targetSummary()
+    local parts = {}
+    for i, id in ipairs(state.targets) do
+        if i > 3 then
+            parts[#parts + 1] = string.format("+%d more", #state.targets - 3)
+            break
+        end
+        parts[#parts + 1] = shortName(id)
+    end
+    return #parts > 0 and table.concat(parts, ", ") or "nothing"
+end
+
+--- Ores from the most recent scan that have a pick number, most useful first.
+--- These are the ones within reach of where the bot is standing right now,
+--- which is exactly the set worth offering at a warp window.
+local function visibleOres()
+    local seen, out = {}, {}
+    for _, b in pairs(lastScan) do
+        local name = b.name
+        if type(name) == "string" and catalogueSet[name] and not seen[name] then
+            seen[name] = true
+            out[#out + 1] = { n = catalogueSet[name], id = name }
+        end
+    end
+    table.sort(out, function(a, b) return a.n < b.n end)
+    return out
 end
 
 local function notePlaced(slot, face)
@@ -469,16 +511,207 @@ local function scanReady()
     return p
 end
 
-local function chat(message)
+--- Put the chat box on, run `action(send)`, and take it back off again.
+---
+--- Everything that talks goes through here so that one equip covers a whole
+--- conversation. The warp announce alone is several lines, and the old code
+--- swapped the arm twice per message.
+---
+--- Nothing in here is allowed to throw. sendMessageToPlayer fails when the
+--- recipient is not logged in, which for an unattended bot is most of the time,
+--- and an error escaping this function during warpPlate() would end the run with
+--- the plate already on the ground. Being unable to talk is not a reason to stop
+--- mining.
+local function withChatBox(action)
+    if turtle.getItemCount(SLOT.chat) == 0 then return false end
     turtle.select(SLOT.chat)
     turtle.equipLeft()
     os.sleep(1)
+
     local box = peripheral.wrap("left")
+    local ran = false
     if box and box.sendMessageToPlayer then
-        box.sendMessageToPlayer(message, PLAYER)
+        local function send(message)
+            pcall(box.sendMessageToPlayer, message, PLAYER)
+        end
+        ran = pcall(action, send)
     end
+
+    turtle.select(SLOT.chat)
     turtle.equipLeft()
     turtle.select(1)
+    return ran
+end
+
+local function chat(message)
+    return withChatBox(function(send) send(message) end)
+end
+
+
+----------------------------------------------------------------------------
+-- Remote ore selection
+----------------------------------------------------------------------------
+
+-- Commands are only heard during the warp window (see warpWindow). Both
+-- peripheral slots are permanently spoken for, so nothing can sit attached
+-- waiting for events, and a message sent while the chat box is stowed is lost
+-- rather than queued. The window rides the hold warpPlate() already takes: the
+-- one moment the bot is idle, already announcing itself, and has a reason to be
+-- wearing the chat box.
+
+local CHAT_PREFIX = "$"        -- AdvancedPeripherals' hidden-message prefix:
+                               -- these reach chat boxes without appearing in
+                               -- public chat.
+local LIST_PER_MESSAGE = 4     -- full ids are long; four is about a chat line.
+
+-- Whether the announce spells out the pick list every window. Three lines every
+-- fourth cycle adds up if you are not using it; set false for the single line.
+local ANNOUNCE_MENU = true
+
+--- Resolve one token of a $ore command to a block id.
+--- A number indexes the catalogue. Anything containing a namespace colon is
+--- taken literally, which is the escape hatch for an ore the bot has not
+--- scanned yet - without it, a missing catalogue entry would mean editing this
+--- file while the turtle is ten thousand blocks away.
+--- Returns id, wasLiteral.
+local function resolvePick(token)
+    local n = tonumber(token)
+    if n then return catalogue[n], false end
+    if token:find(":", 1, true) then return token, true end
+    return nil, false
+end
+
+local function listCatalogue(send)
+    if #catalogue == 0 then
+        send("I have not catalogued any ores yet - I write them down as I scan them.")
+        return
+    end
+    local line = {}
+    for i, id in ipairs(catalogue) do
+        line[#line + 1] = string.format("%d %s", i, id)
+        if #line == LIST_PER_MESSAGE or i == #catalogue then
+            send(table.concat(line, "  |  "))
+            line = {}
+        end
+    end
+    send(string.format("Pick with %sore <numbers>, e.g. %sore 1 3",
+                       CHAT_PREFIX, CHAT_PREFIX))
+end
+
+--- Full ids, deliberately: this is the confirmation that what got selected is
+--- what was meant, so it is the one place worth spending the characters.
+local function reportTargets(send)
+    local visible = 0
+    for _, b in pairs(lastScan) do
+        if b.name and TARGETS[b.name] then visible = visible + 1 end
+    end
+    send("Mining: " .. table.concat(state.targets, ", "))
+    send(string.format("%d of those visible in my last scan.", visible))
+end
+
+--- Apply a $ore command.
+---
+--- An unscanned id is accepted rather than refused - the bot may simply not
+--- have stood near one yet - but it is called out, because it is the only input
+--- that cannot be checked against anything. There is no block registry to ask,
+--- so a typo can never be rejected; it just matches nothing, quietly, for as
+--- long as the bot is left running.
+local function selectOres(rest, send)
+    local picked, unknown, unseen = {}, {}, {}
+    for token in rest:gmatch("[^%s,]+") do
+        local id, literal = resolvePick(token)
+        if not id then
+            unknown[#unknown + 1] = token
+        else
+            picked[#picked + 1] = id
+            if literal and not catalogueSet[id] then unseen[#unseen + 1] = id end
+        end
+    end
+
+    if #unknown > 0 then
+        send(string.format("I do not know %s. Say %sores for the %d I have found.",
+                           table.concat(unknown, ", "), CHAT_PREFIX, #catalogue))
+    end
+    if #picked == 0 then return false end
+
+    setTargets(picked)
+    saveState()
+    reportTargets(send)
+    if #unseen > 0 then
+        send("Careful: I have never scanned " .. table.concat(unseen, ", ") ..
+             ". Set anyway, but check the spelling if nothing turns up.")
+    end
+    return true
+end
+
+--- Returns true if this was a command from the owner. Anyone else on the server
+--- is ignored outright - otherwise any player could retask the bot.
+local function handleCommand(who, message, send)
+    if who ~= PLAYER or type(message) ~= "string" then return false end
+    local body = message:match("^%s*%" .. CHAT_PREFIX .. "(.*)$")
+    if not body then return false end
+
+    local verb, rest = body:match("^(%S+)%s*(.*)$")
+    if not verb then return false end
+    verb = verb:lower()
+
+    if verb == "ores" then
+        listCatalogue(send)
+    elseif verb == "ore" then
+        if rest == "" then reportTargets(send) else selectOres(rest, send) end
+    else
+        send(string.format("I only understand %sore and %sores.",
+                           CHAT_PREFIX, CHAT_PREFIX))
+    end
+    return true
+end
+
+local function announceWindow(send, sent)
+    send(string.format("Warp plate is down%s - %d seconds to collect me. Mining: %s.",
+                       sent and " and the warp stone is on its way to you" or "",
+                       WARP_HOLD_SECONDS, targetSummary()))
+    if not ANNOUNCE_MENU then return end
+
+    -- What is in reach of where the bot is standing, which is the set actually
+    -- worth picking from here. The full catalogue can run to hundreds and stays
+    -- behind $ores.
+    local vis = visibleOres()
+    if #vis > 0 then
+        local parts = {}
+        for i, v in ipairs(vis) do
+            if i > 6 then break end
+            parts[#parts + 1] = string.format("%d %s", v.n, shortName(v.id))
+        end
+        send("Visible here: " .. table.concat(parts, "  |  "))
+    end
+    send(string.format("Pick with %sore <numbers> - %sores lists all %d I have found.",
+                       CHAT_PREFIX, CHAT_PREFIX, #catalogue))
+end
+
+--- Hold the warp point open, listening for commands the whole time.
+---
+--- os.sleep() CANNOT be used here. It is implemented as pull-events-until-my-
+--- timer, and os.pullEvent(filter) discards everything that does not match, so
+--- every chat message arriving during the hold would be pulled off the queue
+--- and thrown away. The window would look right and hear nothing.
+local function warpWindow(sent)
+    local listened = withChatBox(function(send)
+        announceWindow(send, sent)
+        local deadline = os.startTimer(WARP_HOLD_SECONDS)
+        while true do
+            local event, a, b = os.pullEvent()
+            if event == "timer" and a == deadline then
+                break
+            elseif event == "chat" then
+                handleCommand(a, b, send)
+            end
+        end
+        send("The bot has resumed!")
+    end)
+
+    -- No chat box, or it would not equip. The hold still has to happen: someone
+    -- may be walking towards the plate right now.
+    if not listened then os.sleep(WARP_HOLD_SECONDS) end
 end
 
 -- Drive the left arm back to a known state after a restart. Whatever the bot
@@ -777,14 +1010,9 @@ local function warpPlate()
         return
     end
 
-    chat(string.format(
-        "Warp plate is down%s - you have %d seconds to come collect the bot...",
-        sent and " and the warp stone is on its way to you" or "",
-        WARP_HOLD_SECONDS))
-    print("pausing functionality")
-    os.sleep(WARP_HOLD_SECONDS)
+    print("pausing functionality - listening for commands")
+    warpWindow(sent)
     print("resuming functionality")
-    chat("The bot has resumed!")
 
     recoverWarpPlate(plateFace)
     setPhase("mining")
@@ -1017,6 +1245,7 @@ local function scan_and_search(radius)
     -- bolted onto a program whose failure mode is a stranded turtle, so it runs
     -- under pcall: a full disk or a damaged ores.txt must never stop mining.
     pcall(recordScan, scan_data)
+    lastScan = scan_data
 
     local closest_block = 99999
     local closest_x, closest_y, closest_z, closest_name
