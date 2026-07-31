@@ -74,11 +74,40 @@ local WARP_HOLD_SECONDS = 30
 -- up, and the bot only moves 15 blocks between cycles.
 local MAX_MINISCANS = 25
 
--- Below this, break out of a scan chain and refuel rather than chasing one more
--- ore, so a rich vein cannot outrun the refuel schedule even within one bounded
--- cycle. A full move() is 15 blocks and seeking costs more, so this leaves a
--- wide margin over what a single cycle can burn.
-local FUEL_FLOOR = 500
+-- SCANNING RANGE AND WHAT IT COSTS
+--
+-- Measured on this pack with geo_scanner_probe.lua:
+--
+--   radius <= 8   free
+--   radius 9      330 fuel per scan
+--   radius 16     5274 fuel per scan   (the ceiling; scan() refuses above it)
+--   cooldown      ~120ms between scans
+--
+-- The cost is roughly 0.17 fuel per block of the scanned cube beyond the free
+-- radius, so it climbs with the CUBE of the radius: going 8 -> 16 is not twice
+-- the price, it is 5274 times nothing. A lava bucket is 1000 fuel, so a
+-- radius-16 wide scan burns over five buckets EVERY CYCLE.
+--
+-- Only the wide scan uses this. The miniscans that follow a vein stay at
+-- MINI_RADIUS, which is free, so chasing ore costs nothing extra.
+local SCAN_RADIUS_MAX  = 16
+local SCAN_RADIUS_FREE = 8
+local DEFAULT_RADIUS   = 8
+local MINI_RADIUS      = 3
+
+-- The measured cooldown is 120ms; sleep a little longer than that before
+-- retrying a scan that came back nil.
+local SCAN_RETRY_SLEEP = 0.25
+
+-- Fuel floor with a free radius. A paid radius adds its own margin on top - see
+-- fuelFloor() - because the floor has to cover the scans themselves, not just
+-- the walking.
+local FUEL_RESERVE = 500
+
+-- Keep this many wide scans' worth of fuel in the tank above the reserve. Four
+-- cycles is the gap between scheduled refuels, so this is what it takes to
+-- reach the next one without running dry.
+local FUEL_SCANS_IN_HAND = 4
 
 -- WARP PLATES ARE DISABLED. Do not turn this on without reading why.
 --
@@ -218,8 +247,49 @@ local WRAP_RETRY_SLEEP = 0.25
 --            so a crash mid-action leaves a record to clean up.
 -- targets  : the block ids currently being mined. Persisted so that a reboot
 --            resumes the selection instead of reverting to DEFAULT_TARGETS.
+-- radius   : the wide-scan radius. Persisted for the same reason, and because
+--            reverting it silently would change the bot's fuel burn by orders
+--            of magnitude without anyone noticing.
 local state = { deployed = false, phase = "startup", cycles = 0, placed = {},
-                targets = {} }
+                targets = {}, radius = DEFAULT_RADIUS }
+
+-- What a scan of each radius costs in fuel, read from the scanner itself at
+-- startup rather than hardcoded, because it is pack-configurable. Empty until
+-- then, and treated as zero if the scanner will not say.
+local scanCost = {}
+
+local function costOf(radius)
+    return scanCost[radius] or 0
+end
+
+--- The fuel level below which the bot stops what it is doing and refuels.
+---
+--- Scales with the wide-scan radius, because that is what dominates the burn
+--- once it is above the free radius: a radius-16 scan costs 5274, so a fixed
+--- 500 floor would let the bot walk into a scan it cannot pay for. At the
+--- default radius this is just FUEL_RESERVE, exactly as it was before.
+---
+--- Defined here, up with the state it reads, rather than next to refuel(): the
+--- chat commands report it, and they are declared long before refuel is.
+local function fuelFloor()
+    local floor = FUEL_RESERVE + (costOf(state.radius) * FUEL_SCANS_IN_HAND)
+    local limit = turtle.getFuelLimit()
+    if type(limit) == "number" and limit > 0 then
+        -- Never demand more than the tank can hold, or the bot would refuel
+        -- forever and never get back to work.
+        floor = math.min(floor, math.floor(limit * 0.8))
+    end
+    return floor
+end
+
+--- Is fuel low enough to stop what we are doing and go and get some?
+---
+--- getFuelLevel() returns the STRING "unlimited" when fuel is disabled
+--- server-side, so this must not compare numerically without checking.
+local function lowFuel()
+    local f = turtle.getFuelLevel()
+    return type(f) == "number" and f < fuelFloor()
+end
 
 -- Membership set rebuilt from state.targets. The scan loop tests thousands of
 -- blocks a minute, so this is a hash lookup rather than a walk down a list.
@@ -249,6 +319,20 @@ local function setTargets(list)
 end
 
 setTargets(DEFAULT_TARGETS)
+
+--- Set the wide-scan radius, refusing anything the scanner cannot do.
+--- Returns the radius adopted, or nil plus a reason.
+local function setRadius(n)
+    n = tonumber(n)
+    if not n or n ~= math.floor(n) or n < 1 then
+        return nil, "that is not a whole number"
+    end
+    if n > SCAN_RADIUS_MAX then
+        return nil, string.format("the scanner tops out at radius %d", SCAN_RADIUS_MAX)
+    end
+    state.radius = n
+    return n
+end
 
 -- Write to a scratch file and swap it in, rather than writing over the live one.
 --
@@ -311,6 +395,7 @@ local function loadState()
     state.cycles   = tonumber(data.cycles) or 0
     state.placed   = type(data.placed) == "table" and data.placed or {}
     setTargets(type(data.targets) == "table" and data.targets or DEFAULT_TARGETS)
+    if not setRadius(data.radius) then setRadius(DEFAULT_RADIUS) end
     return true
 end
 
@@ -635,6 +720,22 @@ local function listCatalogue(send)
                        CHAT_PREFIX, CHAT_PREFIX))
 end
 
+--- Fuel prices are meaningless as bare numbers, so quote them in lava buckets
+--- as well - that is the unit the refuel chest is actually stocked in.
+local function costPhrase(radius)
+    local c = costOf(radius)
+    if c <= 0 then return "free" end
+    return string.format("%d fuel per scan (~%.1f lava buckets)", c, c / 1000)
+end
+
+local function reportRadius(send)
+    send(string.format("Scan radius %d - %s. Max %d.",
+                       state.radius, costPhrase(state.radius), SCAN_RADIUS_MAX))
+    local f = turtle.getFuelLevel()
+    send(string.format("Fuel %s, refuelling below %d.",
+                       tostring(f), fuelFloor()))
+end
+
 --- Full ids, deliberately: this is the confirmation that what got selected is
 --- what was meant, so it is the one place worth spending the characters.
 local function reportTargets(send)
@@ -718,7 +819,28 @@ local function handleCommand(who, message, send)
     if not verb then return false end
     verb = verb:lower()
 
-    if verb == "ores" then
+    if verb == "radius" then
+        if rest == "" then
+            reportRadius(send)
+        else
+            local n, why = setRadius(rest:match("^(%S+)"))
+            if not n then
+                send(string.format("Cannot set that radius - %s.", why))
+                reportRadius(send)
+            else
+                saveState()
+                send(string.format("Scan radius is now %d - %s.", n, costPhrase(n)))
+                if costOf(n) > 0 then
+                    -- Say what it means per cycle, not just per scan. One wide
+                    -- scan happens per cycle, so this is the running cost of
+                    -- the choice, and at the top of the range it is severe.
+                    send(string.format("That is a wide scan every cycle, so ~%.1f " ..
+                                       "lava buckets per cycle. Refuelling below %d.",
+                                       costOf(n) / 1000, fuelFloor()))
+                end
+            end
+        end
+    elseif verb == "ores" then
         -- Bare "ores" is a command; "ores are great" is a sentence.
         if rest ~= "" and not prefixed then return false end
         listCatalogue(send)
@@ -731,8 +853,8 @@ local function handleCommand(who, message, send)
             return false
         end
     elseif prefixed then
-        send(string.format("I only understand %sore and %sores.",
-                           CHAT_PREFIX, CHAT_PREFIX))
+        send(string.format("I only understand %sore, %sores and %sradius.",
+                           CHAT_PREFIX, CHAT_PREFIX, CHAT_PREFIX))
     else
         return false                       -- ordinary conversation; stay quiet
     end
@@ -774,6 +896,9 @@ local function announceMenu(send)
     end
     send(string.format("Pick with %sore <numbers> - %sores lists all %d I have found.",
                        CHAT_PREFIX, CHAT_PREFIX, #catalogue))
+    send(string.format("Scan radius %d (%s) - %sradius <n> to change, max %d.",
+                       state.radius, costPhrase(state.radius),
+                       CHAT_PREFIX, SCAN_RADIUS_MAX))
 end
 
 --- Open a listening window: announce, then take commands until the time is up.
@@ -1053,30 +1178,64 @@ local function deposit()
     setPhase("mining")
 end
 
---- Is fuel low enough to stop what we are doing and go and get some?
----
---- getFuelLevel() returns the STRING "unlimited" when fuel is disabled
---- server-side, so this must not compare numerically without checking.
-local function lowFuel()
-    local f = turtle.getFuelLevel()
-    return type(f) == "number" and f < FUEL_FLOOR
-end
-
 local function refuel()
     digReady()
     setPhase("refueling")
     local before = turtle.getFuelLevel()
 
+    -- Top up to twice the floor, so the bot leaves with headroom rather than
+    -- sitting exactly on the line and refuelling again next cycle.
+    local target = fuelFloor() * 2
+    local limit = turtle.getFuelLimit()
+    if type(limit) == "number" and limit > 0 then
+        target = math.min(target, math.floor(limit * 0.9))
+    end
+
+    -- Whether any fuel was actually drawn. The tank is often already above
+    -- target - refuel() is called on a schedule, not only when hungry - and in
+    -- that case the level not rising is correct rather than a failure.
+    local drew = false
+
     local ok = withContainer(SLOT.refuel, function(f, _, slot)
-        turtle.select(slot)
-        f.suck()
-        os.sleep(1)
-        turtle.refuel()
-        -- Anything that was not burned goes back where it came from. Without
-        -- this the slot is still full and the chest cannot be recovered into it.
-        if turtle.getItemCount(slot) > 0 then
+        -- Keep drawing until the tank is up to target or the chest runs out.
+        --
+        -- One suck was enough when a cycle cost a few hundred fuel and nothing
+        -- else did. It is not enough now: lava buckets do not stack, so a suck
+        -- yields exactly one bucket - 1000 fuel - while a single radius-16 scan
+        -- costs 5274. At that radius a one-shot refuel loses ground every cycle.
+        --
+        -- The guard bounds this at 32 draws so an empty or jammed chest cannot
+        -- spin here forever.
+        local draws, stale = 0, 0
+        while draws < 32 do
+            local level = turtle.getFuelLevel()
+            if type(level) ~= "number" or level >= target then break end
+
+            draws = draws + 1
             turtle.select(slot)
-            f.drop()
+            if not f.suck() then break end      -- chest is empty
+            drew = true                         -- only once something is in hand
+            os.sleep(0.2)
+            turtle.refuel()
+
+            -- Whatever would not burn goes back where it came from - including
+            -- the EMPTY BUCKET a lava bucket leaves behind, which needs to
+            -- reach home to be refilled. Without this the slot stays occupied
+            -- and the chest cannot be recovered into it.
+            if turtle.getItemCount(slot) > 0 then
+                turtle.select(slot)
+                f.drop()
+            end
+
+            -- Those returned empties are still in the chest, so the next draw
+            -- can pull one straight back out. Give up after a few draws that
+            -- bought nothing rather than cycling the same buckets in and out.
+            if turtle.getFuelLevel() <= level then
+                stale = stale + 1
+                if stale >= 3 then break end
+            else
+                stale = 0
+            end
         end
         return true
     end)
@@ -1092,13 +1251,16 @@ local function refuel()
     -- failure and none of those returns were ever read by the old code, so the
     -- bot could take on nothing for cycle after cycle and only find out at zero.
     --
-    -- Two legitimate reasons the level might not rise, neither of them a fault:
+    -- Three legitimate reasons the level might not rise, none of them a fault:
     --   * Fuel is disabled server-side and getFuelLevel() returns the STRING
     --     "unlimited" - comparing that numerically would throw.
     --   * The tank is already full, so there is nothing left to gain.
-    if type(before) == "number" and type(fuel) == "number" then
-        local limit = turtle.getFuelLimit()
-        local isFull = type(limit) == "number" and fuel >= limit
+    --   * NOTHING WAS DRAWN, because the tank was already above target. refuel()
+    --     runs on a schedule rather than only when hungry, so this is the common
+    --     case, and treating it as a failure would strand a bot with a full tank.
+    if drew and type(before) == "number" and type(fuel) == "number" then
+        local tankSize = turtle.getFuelLimit()
+        local isFull = type(tankSize) == "number" and fuel >= tankSize
         if fuel <= before and not isFull then
             -- The single most dangerous condition there is: still mobile now,
             -- immobile shortly. Spend some of the remaining fuel putting a warp
@@ -1365,6 +1527,15 @@ local function scan_and_search(radius)
     local scanner = peripheral.wrap("left")
     if not scanner or not scanner.scan then return nil end
     local scan_data = scanner.scan(radius)
+    if not scan_data then
+        -- nil is a REFUSAL, not "nothing here" - an empty area returns an empty
+        -- list. The usual cause is the scanner's cooldown, measured at ~120ms,
+        -- and the chase fires scans back to back. Reading a refusal as "no ore"
+        -- abandons a vein the bot is standing in: measured over a fixed run,
+        -- giving up on nil cut progress from 1646 to 303.
+        os.sleep(SCAN_RETRY_SLEEP)
+        scan_data = scanner.scan(radius)
+    end
     digReady()
     if not scan_data then return nil end
 
@@ -1401,15 +1572,17 @@ end
 --- bot alive and reachable - refuel, deposit, the warp announce - runs after
 --- this function returns, so an unbounded chase silently disabled all three.
 local function scan_loop()
-    local success = scan_and_search(8)
-    print("full scan")
+    local success = scan_and_search(state.radius)
+    print("full scan at radius " .. tostring(state.radius))
     local n = 0
     while success ~= nil and n < MAX_MINISCANS do
         if lowFuel() then
             print("fuel low - ending the scan chain to go and refuel")
             break
         end
-        success = scan_and_search(3)
+        -- Miniscans stay at the free radius. Chasing a vein must not multiply
+        -- the cost of a wide scan by twenty-five.
+        success = scan_and_search(MINI_RADIUS)
         n = n + 1
         print("miniscan " .. n)
     end
@@ -1462,6 +1635,27 @@ else
 end
 
 scanReady()
+
+-- Read the price list off the scanner rather than hardcoding it: the free
+-- radius and the cost curve are pack-configurable, and a wrong table here would
+-- set the fuel floor wrongly, which is the one number standing between the bot
+-- and a stranding. Missing or unreadable costs are treated as zero, which
+-- degrades to the old fixed floor rather than to something dangerous.
+do
+    local sc = peripheral.wrap("left")
+    if sc and sc.cost then
+        for r = 1, SCAN_RADIUS_MAX do
+            local ok, c = pcall(sc.cost, r)
+            if ok and type(c) == "number" then scanCost[r] = c end
+        end
+        print(string.format("scan cost: radius %d = %d, radius %d = %d",
+                            SCAN_RADIUS_FREE, costOf(SCAN_RADIUS_FREE),
+                            SCAN_RADIUS_MAX, costOf(SCAN_RADIUS_MAX)))
+    else
+        print("scanner will not quote scan costs; assuming free")
+    end
+end
+
 refuel()
 
 -- Always offer a retargeting window before going back to work, on a first run

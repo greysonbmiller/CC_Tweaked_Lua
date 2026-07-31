@@ -153,7 +153,9 @@ assertThat("no announce line carries two ores", packed == nil,
 --    legitimately be mid-hold. What proves recovery is that the bot warps
 --    REPEATEDLY: it cannot place a plate it never picked up again.
 print("\n[9] the window ends by itself, cycle after cycle")
-r = run(base({ { msg = "$ore 3" } }))
+local opts9 = base({ { msg = "$ore 3" } })
+opts9.budget = 12000     -- needs room for several full cycles, not just one
+r = run(opts9)
 -- The window must NOT depend on a plate going down. It used to live inside the
 -- successful-warp path, so disabling warp plates would have silently disabled
 -- the only way to retarget the bot along with them.
@@ -232,6 +234,59 @@ r = run{ preInv = fullKit(),
          scans = {}, chats = { { msg = "$ore 4" } }, budget = 4000 }
 assertThat("announced that it was starting up", saidAny(r, "Starting up"), allSaid(r))
 assertThat("took a command before mining", targets(r, DIAMOND), stateOf(r))
+
+-- 17. $radius. Measured on the real hardware: free to radius 8, 330 fuel at 9,
+--     5274 at 16, and 16 is the ceiling. A lava bucket is 1000 fuel, so radius
+--     16 is over five buckets PER SCAN - the difference between radii is the
+--     difference between sustainable and not, and the bot has to say so.
+print("\n[17] $radius sets the wide-scan radius")
+local opts17 = base({ { msg = "$radius 9" } })
+opts17.budget = 12000    -- must get past startup and into an actual scan
+r = run(opts17)
+assertThat("recorded the new radius", (stateOf(r)):find("9", 1, true) ~= nil, stateOf(r))
+local usedNine = false
+for _, rad in ipairs(r.scanRadii) do if rad == 9 then usedNine = true end end
+assertThat("actually scanned at 9", usedNine,
+           "radii used: " .. table.concat(r.scanRadii, ","))
+assertThat("quoted the fuel cost", saidAny(r, "330"), allSaid(r))
+
+print("\n[18] $radius refuses a radius the scanner cannot do")
+r = run(base({ { msg = "$radius 99" } }))
+local used99 = false
+for _, rad in ipairs(r.scanRadii) do if rad == 99 then used99 = true end end
+assertThat("never scanned at 99", not used99,
+           "radii used: " .. table.concat(r.scanRadii, ","))
+assertThat("said what the ceiling is", saidAny(r, "16"), allSaid(r))
+
+print("\n[19] $radius alone reports the current setting and its price")
+r = run(base({ { msg = "$radius" } }))
+assertThat("named the radius", saidAny(r, "8"), allSaid(r))
+assertThat("mentioned fuel", saidAny(r, "fuel"), allSaid(r))
+
+-- 20. A cooldown rejection returns nil, exactly as "found nothing" does. Read
+--     as "no ore", it abandons a vein the bot is standing in. The scanner has a
+--     measured 120ms cooldown and the chase fires scans back to back, so this
+--     is not hypothetical.
+--
+--     Every other scan is rejected here, so a miner that gives up on nil can
+--     never chase a vein at all, while one that retries is unaffected. A single
+--     one-off miss would not show the difference - the bot recovers on the next
+--     cycle either way, which is why the first version of this test passed
+--     against code that had no retry.
+print("\n[20] a cooldown rejection is not read as 'no ore'")
+local endlessOre = {}
+for i = 1, 400 do endlessOre[i] = { { name = REDSTONE, x = 0, y = 3, z = 0 } } end
+r = run{ preInv = fullKit(),
+         preFiles = { ["state.txt"] = warpingState({ REDSTONE }), ["ores.txt"] = CATALOGUE },
+         scans = endlessOre, scanMissAlternate = true, budget = 6000 }
+--     Measured on the same budget and terrain: 1646 net-up with no rejections,
+--     303 when every other scan is rejected and the miner gives up on nil. The
+--     threshold sits between the two, so it fails loudly if the retry is lost.
+assertThat("saw rejections at all", r.cooldownMisses > 0,
+           "misses=" .. tostring(r.cooldownMisses))
+assertThat("kept chasing at close to full rate", (r.ups - r.downs) >= 1000,
+           "netUp=" .. (r.ups - r.downs) .. " (no-rejection baseline is ~1646," ..
+           " give-up-on-nil is ~303) misses=" .. tostring(r.cooldownMisses))
 
 print("\n" .. string.rep("=", 64))
 print(string.format("%d passed, %d failed", pass, fail))

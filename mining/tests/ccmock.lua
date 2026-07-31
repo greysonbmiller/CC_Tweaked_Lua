@@ -57,13 +57,19 @@ function M.makeEnv(opts)
     local blocked = opts.blockedFaces or {}
     local contents = { front = {}, up = {}, down = {} }   -- what placed containers hold
     local pendingWrap = {}    -- face -> wrap calls still to be answered with nil
+    -- NBT of blocks WE placed, so digging one back up returns the same item.
+    -- Without this an ender chest loses its frequency the first time it is
+    -- picked up, and every later placement is a generic chest - which silently
+    -- breaks refuelling several cycles later, a long way from the cause.
+    local placedNbt = {}
     local files = {}
     for k, v in pairs(opts.preFiles or {}) do files[k] = v end
 
     local report = { worldDrops = 0, staged = false, budgetHit = false,
                      platePlaced = false, safeDrops = 0, world = world,
                      scanCount = 0, sent = {}, writes = {}, ups = 0, downs = 0,
-                     refuels = 0, ranDry = false, fuel = fuel, minFuel = fuel }
+                     refuels = 0, ranDry = false, fuel = fuel, minFuel = fuel,
+                     scanRadii = {}, cooldownMisses = 0 }
     local budget, steps = opts.budget or 4000, 0
     local function tick()
         steps = steps + 1
@@ -100,9 +106,29 @@ function M.makeEnv(opts)
     end
     function turtle.getFuelLevel() return fuel end
     function turtle.getFuelLimit() return 20000 end
+    -- Real refuelling burns what is in the SELECTED slot, and only if it is
+    -- actually fuel. The old mock added fuel unconditionally, even with an
+    -- empty slot, which quietly hid the whole mechanic: a refuel that drew
+    -- nothing still looked like a success.
+    --
+    -- Lava buckets are the stock in this bot's refuel chest. They do not stack,
+    -- so one draw is one bucket, and burning one leaves an EMPTY BUCKET behind -
+    -- which the bot then puts back in the chest and can draw again.
     function turtle.refuel()
         report.refuels = report.refuels + 1
-        if opts.fuelRises ~= false then fuel = fuel + 800 end
+        local it = inv[selected]
+        if not it then return false end
+        if opts.fuelRises == false then return true end
+
+        if it.name == "minecraft:lava_bucket" then
+            fuel = fuel + 1000
+            inv[selected] = { name = "minecraft:bucket", count = 1 }
+        elseif it.name == "minecraft:coal" then
+            fuel = fuel + 80 * (it.count or 1)
+            inv[selected] = nil
+        else
+            return false                    -- not fuel; it stays put
+        end
         report.fuel = fuel
         return true
     end
@@ -131,8 +157,13 @@ function M.makeEnv(opts)
         local dest
         if not inv[selected] then dest = selected
         else for i = 1, 16 do if not inv[i] then dest = i break end end end
-        if dest then inv[dest] = { name = block, count = 1,
-                                   nbt = opts.worldNbt and opts.worldNbt[face] } end
+        if dest then
+            inv[dest] = { name = block, count = 1,
+                          nbt = placedNbt[face]
+                             or (opts.worldNbt and opts.worldNbt[face]),
+                          displayName = placedNbt[face] and "Ender Chest" or nil }
+        end
+        placedNbt[face] = nil
         return true
     end
     local function placeFace(face)
@@ -142,9 +173,18 @@ function M.makeEnv(opts)
         local it = inv[selected]
         if not it then return false end
         world[face] = it.name
+        placedNbt[face] = it.nbt
         pendingWrap[face] = opts.wrapDelay or 0
         if it.name == PLATE then report.platePlaced = true end
         contents[face] = {}
+        -- The refuel ender chest is stocked from home, so placing it exposes
+        -- fuel. Without this the chest is empty and no refuel can ever succeed,
+        -- which is not a model of anything real.
+        if it.name == M.ENDER and it.nbt == M.HASH_FUEL then
+            for i = 1, (opts.refuelStock or 8) do
+                contents[face][i] = { name = "minecraft:lava_bucket", count = 1 }
+            end
+        end
         it.count = it.count - 1
         if it.count <= 0 then inv[selected] = nil end
         return true
@@ -217,17 +257,46 @@ function M.makeEnv(opts)
     -- rather than letting it spin until the step budget trips.
     local scans = opts.scans or {}
     local scanIndex = 0
+    local scanCalls = 0
 
     local function wrap(side)
         if side == "left" then
             if leftTool == SCANNER then
                 -- No tick(): scanning is not a step. Runs are bounded by the
                 -- scans list running out, not by the step budget.
-                return { scan = function()
-                    scanIndex = scanIndex + 1
-                    report.scanCount = scanIndex
-                    return scans[scanIndex] or {}
-                end }
+                return {
+                    scan = function(r)
+                        scanCalls = scanCalls + 1
+                        report.scanRadii[#report.scanRadii + 1] = r
+                        -- A cooldown rejection returns nil, NOT an empty list.
+                        -- Modelling that is what lets a test prove the miner
+                        -- does not read "wait a moment" as "no ore here".
+                        --
+                        -- scanMissAlternate rejects every other call, so only a
+                        -- miner that RETRIES gets anything done; one that gives
+                        -- up on nil merely limps, which a one-off miss would
+                        -- not have revealed.
+                        local miss = (opts.scanCooldownMisses or 0) > 0
+                                  or (opts.scanMissAlternate and scanCalls % 2 == 1)
+                        if miss then
+                            if (opts.scanCooldownMisses or 0) > 0 then
+                                opts.scanCooldownMisses = opts.scanCooldownMisses - 1
+                            end
+                            report.cooldownMisses = (report.cooldownMisses or 0) + 1
+                            return nil, "You need to wait before scanning again"
+                        end
+                        scanIndex = scanIndex + 1
+                        report.scanCount = scanIndex
+                        return scans[scanIndex] or {}
+                    end,
+                    -- Measured on the real hardware: free to radius 8, then
+                    -- about 0.17 fuel per block of the cube beyond it. Fits the
+                    -- observed 330 at r=9 and 5274 at r=16.
+                    cost = function(r)
+                        if r <= 8 then return 0 end
+                        return math.floor(0.17 * (((2 * r + 1) ^ 3) - (17 ^ 3)))
+                    end,
+                }
             elseif leftTool == CHATBOX then
                 return { sendMessageToPlayer = function(msg, who)
                     report.sent[#report.sent + 1] = { msg = msg, who = who }
