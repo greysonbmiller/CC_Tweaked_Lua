@@ -323,6 +323,36 @@ assertThat("refused a non-direction",
            stateOf(r):find("sideways", 1, true) == nil, stateOf(r))
 assertThat("listed the valid directions", saidAny(r, "north"), allSaid(r))
 
+-- 23. The startup window must not collide with a warp that is already due.
+--
+--     A bot interrupted at cycle 4 comes back, opens its startup window, and
+--     the first pass of the main loop finds a warp due and opens another one
+--     immediately - two windows back to back with no mining between them.
+--
+--     Asserted as "the resume cycle count makes no difference to how many
+--     windows open", which needs no budget tuning: once the schedule restarts
+--     from the startup window, where it was interrupted stops mattering.
+local function windowCount(cycles)
+    local rr = run{ preInv = fullKit(),
+                    preFiles = { ["state.txt"] =
+                        '{["deployed"]=true,["phase"]="mining",["cycles"]=' .. cycles ..
+                        ',["placed"]={},["targets"]={"' .. LAPIS .. '",},}' },
+                    scans = {}, budget = 700 }
+    local n = 0
+    for _, m in ipairs(rr.sent) do
+        local s = tostring(m.msg)
+        if s:find("Listening for", 1, true) or s:find("Warp plate is down", 1, true) then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+print("\n[23] the startup window does not double up with a due warp")
+local wFresh, wDue = windowCount(0), windowCount(4)
+assertThat("resuming mid-schedule opens no extra window", wDue == wFresh,
+           "cycles=0 gave " .. wFresh .. " windows, cycles=4 gave " .. wDue)
+
 print("\n" .. string.rep("=", 64))
 print(string.format("%d passed, %d failed", pass, fail))
 if fail > 0 then os.exit(1) end

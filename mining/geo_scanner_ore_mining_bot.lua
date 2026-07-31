@@ -1765,6 +1765,16 @@ listenWindow(string.format(
     "Starting up%s. Listening %d seconds - retarget me now if you want to.",
     state.deployed and " again" or "", WARP_HOLD_SECONDS))
 
+-- Restart the warp schedule from here. This window IS this run's retargeting
+-- opportunity, so the next one belongs a full four cycles away.
+--
+-- Without this, a bot interrupted at cycle 4 comes back, opens its startup
+-- window, and then the very first pass of the main loop finds a warp already
+-- due and opens a second one immediately - two windows back to back with no
+-- mining between them.
+state.cycles = 0
+saveState()
+
 while true do
     -- Refuel on the schedule OR whenever fuel is low, whichever comes first.
     -- Tying refuelling to the warp schedule alone meant a hungry cycle had to
