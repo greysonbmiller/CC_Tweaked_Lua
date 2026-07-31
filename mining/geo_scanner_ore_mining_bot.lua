@@ -34,8 +34,22 @@
 --    and opened by dropping all sixteen slots - which, restarted in a cave,
 --    threw the entire kit down a hole.
 
-reference_ore = "minecraft:deepslate_lapis_ore"
-reference2 = "minecraft:lapis_ore"
+-- WHICH ORES THE BOT LOOKS FOR
+--
+-- The bot targets ANY NUMBER of block ids at once, not a fixed pair. This list
+-- is only the starting point for a turtle with no state file; from then on the
+-- selection lives in state.txt, so a reboot keeps whatever was last chosen
+-- rather than silently reverting to this line three days into a run.
+--
+-- There is no name-to-id table anywhere in this file, on purpose. The turtle
+-- has no block registry, so a mistyped id can never be rejected - it just
+-- matches nothing, quietly, forever. Instead the bot records the ids the
+-- scanner really returns (see ores.txt below) and you pick from those, so an
+-- id can only be selected if it has actually been observed to exist.
+local DEFAULT_TARGETS = {
+    "minecraft:lapis_ore",
+    "minecraft:deepslate_lapis_ore",
+}
 
 -- How long warpPlate() leaves the warp plate on the ground for you to reach it.
 -- The announcement text is built from this number, so the two can never drift
@@ -123,10 +137,16 @@ local ENDER   = "enderstorage:ender_chest"
 local PLATE   = "waystones:warp_plate"
 local HOPPER  = "mob_grinding_utils:absorption_hopper"
 
-local PLAYER = "veganradiation"
+local PLAYER = "SKAAAAL"
 
 local STATE_FILE = "state.txt"
 local STATE_TMP  = "state.tmp"
+
+-- The catalogue of ore ids the scanner has actually returned. See the block of
+-- catalogue functions further down for why this exists.
+local ORE_FILE = "ores.txt"
+local ORE_TMP  = "ores.tmp"
+local ORE_LIMIT = 500
 
 
 ----------------------------------------------------------------------------
@@ -141,7 +161,39 @@ local STATE_TMP  = "state.tmp"
 -- placed   : face -> slot for every block currently sitting in the world that
 --            belongs to us. Written BEFORE placing and cleared after breaking,
 --            so a crash mid-action leaves a record to clean up.
-local state = { deployed = false, phase = "startup", cycles = 0, placed = {} }
+-- targets  : the block ids currently being mined. Persisted so that a reboot
+--            resumes the selection instead of reverting to DEFAULT_TARGETS.
+local state = { deployed = false, phase = "startup", cycles = 0, placed = {},
+                targets = {} }
+
+-- Membership set rebuilt from state.targets. The scan loop tests thousands of
+-- blocks a minute, so this is a hash lookup rather than a walk down a list.
+local TARGETS = {}
+
+--- Point the bot at a set of block ids. Returns the list actually adopted.
+---
+--- Anything without a namespace colon is dropped: it cannot be a block id, and
+--- letting it through would mean silently mining nothing. An empty result falls
+--- back to DEFAULT_TARGETS rather than leaving the bot with nothing to look
+--- for, since a bot targeting nothing walks and burns fuel forever.
+local function setTargets(list)
+    local clean, seen = {}, {}
+    for _, id in ipairs(list or {}) do
+        if type(id) == "string" and id:find(":", 1, true) and not seen[id] then
+            seen[id] = true
+            clean[#clean + 1] = id
+        end
+    end
+    if #clean == 0 then
+        for _, id in ipairs(DEFAULT_TARGETS) do clean[#clean + 1] = id end
+    end
+    state.targets = clean
+    TARGETS = {}
+    for _, id in ipairs(clean) do TARGETS[id] = true end
+    return clean
+end
+
+setTargets(DEFAULT_TARGETS)
 
 -- Write to a scratch file and swap it in, rather than writing over the live one.
 --
@@ -195,6 +247,7 @@ local function loadState()
         state.phase    = "unknown"
         state.cycles   = 0
         state.placed   = {}
+        setTargets(DEFAULT_TARGETS)
         return true
     end
 
@@ -202,12 +255,100 @@ local function loadState()
     state.phase    = data.phase or "startup"
     state.cycles   = tonumber(data.cycles) or 0
     state.placed   = type(data.placed) == "table" and data.placed or {}
+    setTargets(type(data.targets) == "table" and data.targets or DEFAULT_TARGETS)
     return true
 end
 
 local function setPhase(phase)
     state.phase = phase
     saveState()
+end
+
+
+----------------------------------------------------------------------------
+-- The ore catalogue
+----------------------------------------------------------------------------
+
+-- The turtle cannot ask "is minecraft:diamnod_ore a real block?" - there is no
+-- registry to ask. So a typo cannot be rejected; it just matches nothing and
+-- the bot mines air for an hour. This replaces that missing registry with
+-- observation: every ore-like id the scanner really returns is written down,
+-- and ids are chosen from that list. An id can only be picked if the bot has
+-- seen one with its own scanner.
+--
+-- APPEND-ONLY. An entry's position is the handle used to pick it, so entries
+-- must never be reordered or removed - a number written down during one warp
+-- window has to still mean the same ore at the next one.
+local catalogue = {}          -- ordered ids, index = pick number
+local catalogueSet = {}       -- id -> true, for O(1) "have I seen this?"
+
+-- Pull the id out of a catalogue line, whatever else is on it. Matching the
+-- namespaced token rather than the whole line means the file can carry pick
+-- numbers and comments without the parser caring.
+local function idFromLine(line)
+    if line:match("^%s*#") then return nil end
+    return line:match("([%w_%-%.]+:[%w_%-%./]+)")
+end
+
+-- Ore-like, rather than everything. Recording every block would bury the list
+-- under stone and deepslate within one scan. Kept deliberately loose: an ore
+-- this misses is invisible to the picker, so a few odd blocks slipping in costs
+-- far less than one real ore being excluded. Widen it freely.
+local function looksLikeOre(name)
+    return name:find("_ore") ~= nil
+        or name:find("ore_") ~= nil
+        or name:match("ore$") ~= nil
+        or name:find("debris") ~= nil
+        or name:find("raw_") ~= nil
+end
+
+local function loadCatalogue()
+    catalogue, catalogueSet = {}, {}
+    local raw = readFile(ORE_FILE)
+    if not raw then return end
+    for line in raw:gmatch("[^\r\n]+") do
+        local id = idFromLine(line)
+        if id and not catalogueSet[id] then
+            catalogueSet[id] = true
+            catalogue[#catalogue + 1] = id
+        end
+    end
+end
+
+local function saveCatalogue()
+    local f = fs.open(ORE_TMP, "w")
+    if not f then return false end
+    f.write("# Ore blocks this turtle has scanned, in the order it first saw\n")
+    f.write("# them. Pick by the number on the left:   $ore 3 7\n")
+    for i, id in ipairs(catalogue) do
+        f.write(string.format("%d\t%s\n", i, id))
+    end
+    f.close()
+    if fs.exists(ORE_FILE) then fs.delete(ORE_FILE) end
+    fs.move(ORE_TMP, ORE_FILE)
+    return true
+end
+
+--- Fold one scan result into the catalogue. Returns true if anything was new.
+---
+--- Written ONLY when the set actually grew. scan_loop scans in a tight loop, so
+--- saving every time would rewrite the file several times a second to say the
+--- same thing. New discoveries tail off quickly once the bot settles into an
+--- area, so in practice this writes a few times on arriving somewhere new and
+--- then goes quiet.
+local function recordScan(scan_data)
+    local grew = false
+    for _, b in pairs(scan_data) do
+        local name = b.name
+        if type(name) == "string" and not catalogueSet[name] and looksLikeOre(name) then
+            if #catalogue >= ORE_LIMIT then break end
+            catalogueSet[name] = true
+            catalogue[#catalogue + 1] = name
+            grew = true
+        end
+    end
+    if grew then saveCatalogue() end
+    return grew
 end
 
 local function notePlaced(slot, face)
@@ -871,10 +1012,16 @@ local function scan_and_search(radius)
     digReady()
     if not scan_data then return nil end
 
+    -- Catalogue everything ore-like BEFORE filtering, so ores the bot is not
+    -- currently looking for still become pickable later. This is a convenience
+    -- bolted onto a program whose failure mode is a stranded turtle, so it runs
+    -- under pcall: a full disk or a damaged ores.txt must never stop mining.
+    pcall(recordScan, scan_data)
+
     local closest_block = 99999
     local closest_x, closest_y, closest_z, closest_name
     for _, item_data in pairs(scan_data) do
-        if item_data.name == reference_ore or item_data.name == reference2 then
+        if TARGETS[item_data.name] then
             local block_distance = calcDist(item_data.x, item_data.y, item_data.z)
             if block_distance < closest_block then
                 closest_block = block_distance
@@ -907,6 +1054,9 @@ end
 
 installStartup()
 loadState()
+-- Never fatal: a bot with no catalogue simply has nothing to offer as a
+-- pick-list yet, and rebuilds one from its next scan.
+pcall(loadCatalogue)
 
 -- Always do these two first, whatever kind of start this is. Both are safe to
 -- run when there is nothing to do.

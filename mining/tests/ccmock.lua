@@ -1,0 +1,357 @@
+-- A mock CC:Tweaked environment, good enough to LOAD AND RUN the real miner
+-- files under (setfenv, Lua 5.1). Shared by every harness in this directory so
+-- there is exactly one model of the turtle to keep honest - two mocks drifting
+-- apart is how the previous guard harness quietly stopped testing anything.
+--
+-- The mock measures behaviour rather than describing it. worldDrops counts every
+-- drop that lands somewhere which is not a confirmed inventory, so the no-drop
+-- invariant is checked directly instead of by reading the code and agreeing
+-- with it.
+--
+-- Two mock behaviours are load-bearing and easy to get wrong. Both hid real
+-- bugs when they were first modelled lazily:
+--   * turtle.dig() fills the SELECTED slot first, then spills over.
+--   * turtle.suck() always draws the container's LOWEST-numbered occupied slot;
+--     it cannot be pointed at a slot.
+
+local M = {}
+
+M.ENDER     = "enderstorage:ender_chest"
+M.HASH_WARP = "059ada3ad2e70e2bc43dcd9eeb0f95ca"
+M.HASH_DEPO = "470db3a18c6e1b98f579261f3bce12ef"
+M.HASH_FUEL = "d4ac434678cee65f5c34a6abca08db6e"
+M.SCANNER   = "advancedperipherals:geo_scanner"
+M.CHATBOX   = "advancedperipherals:chat_box"
+M.PLATE     = "waystones:warp_plate"
+M.HOPPER    = "mob_grinding_utils:absorption_hopper"
+M.PICKAXE   = "minecraft:diamond_pickaxe"
+
+M.CONTAINERS = { [M.ENDER] = true, ["minecraft:chest"] = true }
+
+-- A full, correctly-sorted kit as it sits after staging.
+function M.fullKit()
+    return {
+        [10] = { name = M.CHATBOX, count = 1 },
+        [11] = { name = M.ENDER, nbt = M.HASH_WARP, displayName = "Ender Chest", count = 1 },
+        [12] = { name = M.HOPPER, count = 1 },
+        [13] = { name = M.PLATE,  count = 1 },
+        [14] = { name = M.ENDER, nbt = M.HASH_DEPO, displayName = "Ender Chest", count = 1 },
+        [15] = { name = M.SCANNER, count = 1 },
+        [16] = { name = M.ENDER, nbt = M.HASH_FUEL, displayName = "Ender Chest", count = 1 },
+    }
+end
+
+-- opts: preInv, preFiles, world, worldNbt, blockedFaces, frontChest, budget,
+--       fuelRises, scans, chats, player
+function M.makeEnv(opts)
+    local SCANNER, CHATBOX = M.SCANNER, M.CHATBOX
+    local PLATE, PICKAXE, CONTAINERS = M.PLATE, M.PICKAXE, M.CONTAINERS
+
+    local inv = {}
+    for s, it in pairs(opts.preInv or {}) do inv[s] = { name = it.name, count = it.count or 1,
+                                                        nbt = it.nbt, displayName = it.displayName } end
+    local selected, leftTool = 1, PICKAXE
+    local fuel = 500
+    local world = {}
+    for k, v in pairs(opts.world or {}) do world[k] = v end
+    local blocked = opts.blockedFaces or {}
+    local contents = { front = {}, up = {}, down = {} }   -- what placed containers hold
+    local files = {}
+    for k, v in pairs(opts.preFiles or {}) do files[k] = v end
+
+    local report = { worldDrops = 0, staged = false, budgetHit = false,
+                     platePlaced = false, safeDrops = 0, world = world,
+                     scanCount = 0, sent = {}, writes = {}, ups = 0, downs = 0 }
+    local budget, steps = opts.budget or 4000, 0
+    local function tick()
+        steps = steps + 1
+        if steps > budget then report.budgetHit = true; error("__BUDGET__", 0) end
+    end
+
+    -- The supply chest in front, present only on a genuine base start.
+    local supply = opts.frontChest
+
+    local turtle = {}
+    function turtle.select(s) selected = s return true end
+    function turtle.getItemCount(s)
+        local it = inv[s or selected]; return it and it.count or 0
+    end
+    function turtle.getItemDetail(s, detailed)
+        local it = inv[s or selected]
+        if not it then return nil end
+        local d = { name = it.name, count = it.count }
+        if detailed then d.nbt = it.nbt; d.displayName = it.displayName end
+        return d
+    end
+    function turtle.transferTo(dest, n)
+        local src = inv[selected]
+        if not src then return false end
+        if inv[dest] then return false end
+        inv[dest] = src; inv[selected] = nil
+        return true
+    end
+    function turtle.equipLeft()
+        local held = inv[selected]
+        inv[selected] = leftTool and { name = leftTool, count = 1 } or nil
+        leftTool = held and held.name or nil
+        return true
+    end
+    function turtle.getFuelLevel() return fuel end
+    function turtle.getFuelLimit() return 20000 end
+    function turtle.refuel()
+        if opts.fuelRises ~= false then fuel = fuel + 800 end
+        return true
+    end
+
+    local function digFace(face)
+        tick()
+        if not world[face] then return false end
+        -- Digging a container spills whatever is inside onto the ground.
+        for _ in pairs(contents[face]) do end
+        local block = world[face]
+        world[face] = nil
+        contents[face] = {}
+        -- Real turtle.dig() fills the SELECTED slot first, then spills over.
+        local dest
+        if not inv[selected] then dest = selected
+        else for i = 1, 16 do if not inv[i] then dest = i break end end end
+        if dest then inv[dest] = { name = block, count = 1,
+                                   nbt = opts.worldNbt and opts.worldNbt[face] } end
+        return true
+    end
+    local function placeFace(face)
+        tick()
+        if blocked[face] then return false end
+        if world[face] then return false end
+        local it = inv[selected]
+        if not it then return false end
+        world[face] = it.name
+        if it.name == PLATE then report.platePlaced = true end
+        contents[face] = {}
+        it.count = it.count - 1
+        if it.count <= 0 then inv[selected] = nil end
+        return true
+    end
+    local function dropFace(face)
+        tick()
+        local it = inv[selected]
+        if not it then return false end
+        if world[face] and CONTAINERS[world[face]] then
+            table.insert(contents[face], it)      -- landed safely
+            report.safeDrops = report.safeDrops + it.count
+        else
+            report.worldDrops = report.worldDrops + it.count   -- THE BUG
+        end
+        inv[selected] = nil
+        return true
+    end
+    local function suckFace(face)
+        tick()
+        -- The supply chest at base is modelled separately from placed blocks.
+        if face == "front" and supply then
+            local first
+            for s in pairs(supply) do if not first or s < first then first = s end end
+            if not first then return false end
+            if inv[selected] then return false end
+            inv[selected] = supply[first]; supply[first] = nil
+            return true
+        end
+        if world[face] and CONTAINERS[world[face]] then
+            local it = table.remove(contents[face])
+            if not it then return false end
+            if inv[selected] then return false end
+            inv[selected] = it
+            return true
+        end
+        return false
+    end
+    local function inspectFace(face)
+        if not world[face] then return false, nil end
+        return true, { name = world[face] }
+    end
+
+    turtle.dig       = function() return digFace("front") end
+    turtle.digUp     = function() return digFace("up")    end
+    turtle.digDown   = function() return digFace("down")  end
+    turtle.place     = function() return placeFace("front") end
+    turtle.placeUp   = function() return placeFace("up")    end
+    turtle.placeDown = function() return placeFace("down")  end
+    turtle.drop      = function() return dropFace("front") end
+    turtle.dropUp    = function() return dropFace("up")    end
+    turtle.dropDown  = function() return dropFace("down")  end
+    turtle.suck      = function() return suckFace("front") end
+    turtle.suckUp    = function() return suckFace("up")    end
+    turtle.suckDown  = function() return suckFace("down")  end
+    turtle.inspect     = function() return inspectFace("front") end
+    turtle.inspectUp   = function() return inspectFace("up")    end
+    turtle.inspectDown = function() return inspectFace("down")  end
+    turtle.forward = function() tick() return true end
+    -- ups/downs exist so a test can prove the bot actually went for an ore.
+    -- seek() is the only thing that moves vertically by more than it comes
+    -- back: the hopper pass is exactly one down and one up, so it nets to
+    -- zero, and netUp > 0 means an upward seek and nothing else.
+    turtle.up = function() tick() report.ups = report.ups + 1 return true end
+    turtle.down = function() tick() report.downs = report.downs + 1 return true end
+    turtle.turnLeft = function() tick() return true end
+    turtle.turnRight = function() tick() return true end
+
+    -- Successive scan results. Each scan() call consumes the next entry; once
+    -- they run out the scanner sees nothing, which is what stops a test run
+    -- rather than letting it spin until the step budget trips.
+    local scans = opts.scans or {}
+    local scanIndex = 0
+
+    local function wrap(side)
+        if side == "left" then
+            if leftTool == SCANNER then
+                -- No tick(): scanning is not a step. Runs are bounded by the
+                -- scans list running out, not by the step budget.
+                return { scan = function()
+                    scanIndex = scanIndex + 1
+                    report.scanCount = scanIndex
+                    return scans[scanIndex] or {}
+                end }
+            elseif leftTool == CHATBOX then
+                return { sendMessageToPlayer = function(msg, who)
+                    report.sent[#report.sent + 1] = { msg = msg, who = who }
+                    return true
+                end }
+            end
+            return nil
+        end
+        if side == "front" and supply then
+            report.staged = true
+            return {
+                list = function()
+                    local out = {}
+                    for s, it in pairs(supply) do out[s] = { count = it.count or 1 } end
+                    return out
+                end,
+                getItemDetail = function(s) return supply[s] end,
+            }
+        end
+        if world[side] and CONTAINERS[world[side]] then
+            return { list = function() return {} end }
+        end
+        return nil
+    end
+    local function getType(side)
+        if side == "left" then
+            if leftTool == SCANNER then return SCANNER end
+            if leftTool == CHATBOX then return CHATBOX end
+            return nil
+        end
+        return nil
+    end
+
+    -- Minimal fs / textutils so state.txt genuinely round-trips.
+    local function ser(v)
+        if type(v) == "table" then
+            local out = {"{"}
+            for k, val in pairs(v) do
+                local key = type(k) == "string" and ("[" .. string.format("%q", k) .. "]")
+                                                 or ("[" .. tostring(k) .. "]")
+                out[#out+1] = key .. "=" .. ser(val) .. ","
+            end
+            out[#out+1] = "}"
+            return table.concat(out)
+        elseif type(v) == "string" then return string.format("%q", v)
+        else return tostring(v) end
+    end
+    local textutils = {
+        serialize = ser,
+        unserialize = function(s)
+            local f = loadstring("return " .. s)
+            if not f then return nil end
+            local ok, v = pcall(f)
+            return ok and v or nil
+        end,
+    }
+    local fsmock = {
+        exists = function(p) return files[p] ~= nil end,
+        delete = function(p) files[p] = nil end,
+        move = function(a, b) files[b] = files[a]; files[a] = nil end,
+        open = function(p, mode)
+            if mode == "r" then
+                if not files[p] then return nil end
+                return { readAll = function() return files[p] end, close = function() end }
+            end
+            local buf = {}
+            return {
+                write = function(s) buf[#buf+1] = s end,
+                close = function()
+                    files[p] = table.concat(buf)
+                    -- Every completed write, in order, so a test can prove a
+                    -- file is only rewritten when it actually changed.
+                    report.writes[#report.writes + 1] = p
+                end,
+            }
+        end,
+    }
+
+    -- Queued chat events, delivered to os.pullEvent in order. Anything the
+    -- miner pulls after they run out gets its own timer back, which is what
+    -- ends a listening window.
+    local pending = {}
+    for _, c in ipairs(opts.chats or {}) do pending[#pending + 1] = c end
+    local nextTimer = 0
+    local liveTimers = {}
+
+    local mockOs = setmetatable({
+        -- Deliberately does NOT tick: sleeping is not a step, and charging the
+        -- budget for it starves scenarios that legitimately sleep a lot.
+        sleep = function() end,
+        startTimer = function()
+            nextTimer = nextTimer + 1
+            liveTimers[#liveTimers + 1] = nextTimer
+            return nextTimer
+        end,
+        pullEvent = function(filter)
+            tick()
+            -- A queued chat is only visible while the chat box is on the arm,
+            -- exactly as the real peripheral behaves.
+            if leftTool == CHATBOX and #pending > 0 and (not filter or filter == "chat") then
+                local c = table.remove(pending, 1)
+                return "chat", c.who or opts.player or "SKAAAAL", c.msg, "uuid", true
+            end
+            local t = table.remove(liveTimers, 1)
+            return "timer", t or 0
+        end,
+        time = function() return 0 end,
+        clock = os.clock,
+    }, { __index = os })
+
+    local env = {
+        turtle = turtle,
+        peripheral = { wrap = wrap, getType = getType },
+        fs = fsmock,
+        textutils = textutils,
+        shell = { getRunningProgram = function() return opts.target end },
+        os = mockOs,
+        -- The ATM variant waits on io.read() at a warp point by design.
+        io = { read = function() return "" end },
+        print = function() end,
+        string = string, table = table, math = math, pairs = pairs, ipairs = ipairs,
+        type = type, tostring = tostring, tonumber = tonumber, error = error,
+        pcall = pcall, select = select, unpack = unpack, loadstring = loadstring,
+        setmetatable = setmetatable, next = next, rawget = rawget,
+    }
+    env._G = env
+    return env, report, files, inv
+end
+
+--- Load and run the real miner file under a fresh mock world.
+function M.run(target, opts)
+    opts = opts or {}
+    opts.target = target
+    local chunk, loadErr = loadfile(target)
+    if not chunk then error("LOAD: " .. tostring(loadErr)) end
+    local env, report, files, inv = M.makeEnv(opts)
+    setfenv(chunk, env)
+    local ok, err = pcall(chunk)
+    report.ok, report.err = ok, tostring(err)
+    report.files, report.inv = files, inv
+    return report
+end
+
+return M
