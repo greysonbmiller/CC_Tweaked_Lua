@@ -1,4 +1,17 @@
 
+-- PERIPHERAL SLOTS - both are spoken for, permanently.
+--
+-- RIGHT: chunk loader. Reserved. Never unequip it while the bot is running.
+--   Away from a player the chunk loader is the only thing keeping the chunk
+--   loaded, so unequipping it unloads the chunk, kills the running program and
+--   strands the bot where it stands until someone walks out to it.
+-- LEFT:  time-shared three ways - diamond pickaxe (digReady), geo scanner
+--   (scanReady) and chat box (chat). Only one is attached at a time.
+--
+-- Consequence: there is no free slot for a permanently-attached listener, so
+-- the bot cannot sit and wait on chat or rednet events. Anything sent to it
+-- while the relevant peripheral is stowed is lost, not queued.
+
 reference_ore = "allthemodium:allthemodium_slate_ore"
 reference2 = "allthemodium:allthemodium_ore"
 
