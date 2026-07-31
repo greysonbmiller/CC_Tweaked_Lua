@@ -19,25 +19,36 @@ reference2 = "allthemodium:allthemodium_ore"
 -- slot each thing goes to. Keys are matched against an item's display name
 -- first, then its item id, then its NBT hash.
 --
--- The three chests are matched by DISPLAY NAME. Rename them in an anvil to
--- exactly these strings - they are all the same item id, so the id alone cannot
--- tell them apart. (This replaced three hardcoded NBT hashes from the world
--- this was written in, which cannot be reproduced anywhere else.)
---
--- ALL THREE ARE ENDERSTORAGE ENDER CHESTS, on three different frequencies.
--- That is why they share one item id and differ only in NBT - the frequency
--- lives in the NBT - and it is why the code can place a chest, use it, and
--- break it again a moment later without losing anything: the contents live in
--- the ender network, not in the block. Consequences worth knowing:
+-- ALL THREE CHESTS ARE ENDERSTORAGE ENDER CHESTS, on three different
+-- frequencies. That is why they share one item id and differ only in NBT - the
+-- frequency lives in the NBT - and it is why the code can place a chest, use it
+-- and break it again a moment later without losing anything: the contents live
+-- in the ender network, not in the block. Consequences worth knowing:
 --   * deposit() sends loot home instantly, from any distance or dimension.
 --   * refuel() draws from home, so the bot can be restocked mid-run without
 --     anyone travelling to it.
---   * Anvil-renaming changes only the label, never the frequency. The names
---     below exist purely so this script can tell the three apart when staging.
+--
+-- THE THREE CHESTS ARE MATCHED BY NBT HASH, and must be. Do NOT switch back to
+-- matching them by display name. That was tried and it failed: this server
+-- strips anvil names, and once stripped all three report the identical display
+-- name "Ender Chest". Since display name is tried FIRST, a single
+-- ["Ender Chest"] key would send whichever chest came out of the supply chest
+-- first to that slot and leave the other two unstaged - after which refuel()
+-- places nothing, sucks nothing, and the bot runs its fuel to zero and strands
+-- wherever it happens to be standing.
+--
+-- The hashes below are derived from the FREQUENCY, not from the item stack, so
+-- they survive name-stripping and are stable across relogs and restarts
+-- (confirmed by running the probe before and after a restart and diffing).
+-- They change only if a chest is re-keyed to a different frequency; if that
+-- happens, re-run mining/ender_chest_probe.lua to read the new ones.
 item_table = {
-     ["Warp"]    = 11,                                        -- anvil-rename the warp plate chest to this
-     ["Deposit"] = 14,                                        -- anvil-rename the deposit chest to this
-     ["Refuel"]  = 16,                                        -- anvil-rename the refuel chest to this
+     -- Ender chests, keyed by frequency NBT hash. Read off the probe on
+     -- day 193, in the name-stripped state, loaded Warp -> Deposit -> Refuel.
+     ["059ada3ad2e70e2bc43dcd9eeb0f95ca"] = 11,               -- Warp: receives the activated warp stone
+     ["470db3a18c6e1b98f579261f3bce12ef"] = 14,               -- Deposit: mined loot goes home
+     ["d4ac434678cee65f5c34a6abca08db6e"] = 16,               -- Refuel: fuel comes from home
+     -- Everything below is unique by item id and needs no NBT.
      ["mob_grinding_utils:absorption_hopper"] = 12,           -- vacuum hopper (item name)
      ["waystones:warp_plate"] = 13,                           -- warp plate (item name)
      ["advancedperipherals:geo_scanner"] = 15,                -- geo scanner (item name)
@@ -174,8 +185,11 @@ end
                 local label, target = "?", nil
                 if itemDetails then
                     label = itemDetails.displayName or itemDetails.name
-                    -- display name first, so the anvil-renamed chests beat the
-                    -- shared item id they all have; then item id; then NBT hash
+                    -- Display name, then item id, then NBT hash. Nothing is
+                    -- keyed by display name any more (see item_table) - the
+                    -- lookup is kept only so a future one-off can be matched
+                    -- that way. The ender chests resolve on the NBT branch;
+                    -- every other staged item resolves on the item id branch.
                     target = item_mapping[itemDetails.displayName]
                           or item_mapping[itemDetails.name]
                           or item_mapping[itemDetails.nbt]
@@ -200,6 +214,54 @@ end
 
             print("--- Chest item transfer complete ---")
             
+            -- STAGING GUARD. The loop above is best-effort: it stops at the
+            -- first thing it cannot pull and then carries on as though nothing
+            -- happened. Nothing downstream ever checks its work, so a chest
+            -- that failed to stage stays invisible until the bot is already
+            -- thousands of blocks out - at which point refuel() places nothing,
+            -- sucks from empty air, fails silently, and the bot burns the last
+            -- of its fuel and strands where nobody can reach it.
+            --
+            -- Fail here instead, parked in front of the supply chest, where
+            -- recovering costs nothing but a re-run. These three slots are what
+            -- stand between the bot and being lost:
+            --   16 refuel  - without it there is no way to take on fuel, and
+            --                this is the one that actually strands the bot.
+            --   14 deposit - without it the loot slots fill and mining stalls.
+            --   11 warp    - without it the warp stone cannot be sent home, so
+            --                there is no way for you to reach the bot at all.
+            -- Ordered list rather than a slot->name table so the report reads
+            -- the same every time; pairs() would scramble the order.
+            local required = {
+                { slot = 11, what = "warp ender chest"    },
+                { slot = 14, what = "deposit ender chest" },
+                { slot = 16, what = "refuel ender chest"  },
+            }
+            local missing = {}
+            for _, req in ipairs(required) do
+                if turtle.getItemCount(req.slot) == 0 then
+                    missing[#missing + 1] = string.format("slot %d (%s)", req.slot, req.what)
+                end
+            end
+            if #missing > 0 then
+                print("")
+                print("STAGING FAILED - refusing to start the run.")
+                for _, m in ipairs(missing) do
+                    print("  missing: " .. m)
+                end
+                print("")
+                print("Check the supply chest really holds all three ender chests,")
+                print("and that their NBT hashes still match item_table. If a")
+                print("frequency was re-keyed, re-run ender_chest_probe.lua to")
+                print("read the new hashes.")
+                -- Deliberately NOT chat() here. chat() swaps whatever is on the
+                -- left arm into slot 10, and if staging failed slot 10 may be
+                -- empty - that would unequip the pickaxe and then crash on a nil
+                -- peripheral instead of printing any of the above. Level 0 keeps
+                -- the file:line prefix off the message.
+                error("staging incomplete: " .. table.concat(missing, ", "), 0)
+            end
+
             -- Original code also included a dig operation after chest inspection
             turtle.select(12) -- Select slot 12
             turtle.dig()     -- Attempt to dig the block in front
@@ -299,6 +361,7 @@ end
 local function refuel()
     digReady()
     turtle.dig()
+    local before = turtle.getFuelLevel()
     turtle.select(16)
     turtle.place()
     turtle.suck()
@@ -308,6 +371,35 @@ local function refuel()
     turtle.dig()
     fuel = turtle.getFuelLevel()
     print("Fuel Level is now... " .. fuel)
+
+    -- REFUEL GUARD. Every call above tolerates failure silently: place() onto an
+    -- occupied block, suck() from an empty chest and refuel() on a non-fuel item
+    -- all simply return false, and none of those return values were ever read.
+    -- So the bot could "refuel" cycle after cycle, take on nothing at all, and
+    -- not find out until it hit zero - stopped far from home, with no warp plate
+    -- down and no way to call for help.
+    --
+    -- Rather than check each call individually, check the only thing that
+    -- actually matters: did the fuel level go up?
+    --
+    -- Two legitimate reasons it might not, neither of which is a fault:
+    --   * Fuel is disabled server-side, and getFuelLevel() returns the STRING
+    --     "unlimited" - comparing that numerically would throw.
+    --   * The tank is already full, so there is nothing left to gain.
+    if type(before) == "number" and type(fuel) == "number" then
+        local limit = turtle.getFuelLimit()
+        local isFull = type(limit) == "number" and fuel >= limit
+        if fuel <= before and not isFull then
+            local msg = string.format(
+                "REFUEL FAILED - fuel stuck at %d. Stopping before I strand.", fuel)
+            print(msg)
+            -- pcall: the chat box is staged in slot 10 and should be here, but a
+            -- warning must never crash ahead of the halt it is warning about.
+            pcall(chat, msg)
+            error(string.format(
+                "refuel failed: fuel did not rise (%d -> %d)", before, fuel), 0)
+        end
+    end
 end
 
 local function seek(x,y,z)
