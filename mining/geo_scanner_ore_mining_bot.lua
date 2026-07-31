@@ -937,10 +937,16 @@ local function scuttle(send)
     --    place() returns - but no dig() at the end: this chest is not coming
     --    back up.
     local face, f
-    if turtle.getItemCount(SLOT.deposit) > 0 then
-        for _, candidate in ipairs(FACE_ORDER) do
+    -- True only when the chest went down BEHIND us and we stayed rotated to
+    -- keep it addressable. Every path that returns to mining has to undo that;
+    -- the paths that power off do not care.
+    local turnedAround = false
+    local function tryPlace(candidates)
+        for _, candidate in ipairs(candidates) do
             local cf = FACE[candidate]
-            cf.dig()                        -- best effort; failure is fine
+            -- Gravel-aware, like withContainer: one dig into a falling column
+            -- clears a block and lets the next drop straight into it.
+            clear(cf.detect, cf.dig)
             turtle.select(SLOT.deposit)
             if cf.place() then
                 notePlaced(SLOT.deposit, candidate)
@@ -952,7 +958,7 @@ local function scuttle(send)
                 end
                 if wrapped then
                     face, f = candidate, cf
-                    break
+                    return true
                 end
                 -- Placed something that never wrapped as an inventory. Take it
                 -- straight back rather than leaving it down or, worse,
@@ -960,6 +966,36 @@ local function scuttle(send)
                 turtle.select(SLOT.deposit)
                 cf.dig()
                 noteRemoved(candidate)
+            end
+        end
+        return false
+    end
+
+    if turtle.getItemCount(SLOT.deposit) > 0 then
+        if not tryPlace(FACE_ORDER) then
+            -- BEHIND ME. Same MineColonies problem the mining deposit hits: a
+            -- claim denies block placement outright, so front, up and down all
+            -- refuse while the turtle sits in open space. The block behind is
+            -- the one it just walked out of - known air, and often outside
+            -- whatever it walked into.
+            --
+            -- NOTE THE ASYMMETRY WITH withContainer, which undoes its turns.
+            -- Here, if the chest goes down we deliberately STAY turned around:
+            -- every drop below is f.drop() into the face the chest is on, and
+            -- this turtle is powering off for good, so its facing stops
+            -- mattering the moment the placement succeeds. Turning back would
+            -- leave the chest behind us and every subsequent drop would throw
+            -- the kit on the floor.
+            --
+            -- If it does NOT go down we turn back, because the abort path below
+            -- returns to normal mining and state.facing matters again there.
+            turtle.turnLeft()
+            turtle.turnLeft()
+            if tryPlace({ "front" }) then
+                turnedAround = true
+            else
+                turtle.turnLeft()
+                turtle.turnLeft()
             end
         end
     end
@@ -1059,6 +1095,14 @@ local function scuttle(send)
             turtle.select(firstEmptySlot() or SLOT.deposit)
             clear(f.detect, f.dig)
             noteRemoved(face)
+        end
+        -- Undo the behind-placement rotation. This path goes back to MINING, so
+        -- state.facing has to be true again or seek() walks the wrong way for
+        -- the rest of the run. Done after the dig above, which needs the chest
+        -- still in front of us.
+        if turnedAround then
+            turtle.turnLeft()
+            turtle.turnLeft()
         end
         -- Same detached-handle trap as the abort path above: `send` died the
         -- moment digReady() ran. Re-equip and wrap fresh, if the chat box is
