@@ -23,6 +23,17 @@ reference2 = "allthemodium:allthemodium_ore"
 -- exactly these strings - they are all the same item id, so the id alone cannot
 -- tell them apart. (This replaced three hardcoded NBT hashes from the world
 -- this was written in, which cannot be reproduced anywhere else.)
+--
+-- ALL THREE ARE ENDERSTORAGE ENDER CHESTS, on three different frequencies.
+-- That is why they share one item id and differ only in NBT - the frequency
+-- lives in the NBT - and it is why the code can place a chest, use it, and
+-- break it again a moment later without losing anything: the contents live in
+-- the ender network, not in the block. Consequences worth knowing:
+--   * deposit() sends loot home instantly, from any distance or dimension.
+--   * refuel() draws from home, so the bot can be restocked mid-run without
+--     anyone travelling to it.
+--   * Anvil-renaming changes only the label, never the frequency. The names
+--     below exist purely so this script can tell the three apart when staging.
 item_table = {
      ["Warp"]    = 11,                                        -- anvil-rename the warp plate chest to this
      ["Deposit"] = 14,                                        -- anvil-rename the deposit chest to this
@@ -213,6 +224,11 @@ end
 
 
 
+-- Place the ender chest, empty the loot slots into it, break it again. The
+-- chest is an EnderStorage ender chest, so the items go straight to the
+-- matching frequency at home - breaking the block does NOT scatter them on the
+-- ground. This whole pattern is only safe because it is an ender chest; with a
+-- vanilla chest it would drop everything at the bot's feet every cycle.
 local function deposit()
     digReady()
     turtle.dig()
