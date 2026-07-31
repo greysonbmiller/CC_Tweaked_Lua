@@ -2,10 +2,18 @@
 reference_ore = "minecraft:deepslate_lapis_ore"
 reference2 = "minecraft:lapis_ore"
 
+-- Staging map: what the turtle pulls out of the chest in front of it, and which
+-- slot each thing goes to. Keys are matched against an item's display name
+-- first, then its item id, then its NBT hash.
+--
+-- The three chests are matched by DISPLAY NAME. Rename them in an anvil to
+-- exactly these strings - they are all the same item id, so the id alone cannot
+-- tell them apart. (This replaced three hardcoded NBT hashes from the world
+-- this was written in, which cannot be reproduced anywhere else.)
 item_table = {
-     ["bd1cda511ce2e0eab47114c078331bfd"] = 11,               -- warp plate chest (example NBT)
-     ["e8cd9eb49d8937b8fb01eb8168d5dfa4"] = 14,               -- deposit chest (example NBT)
-     ["5ebb53ada9faf3195b5b112dcc9bf624"] = 16,               -- refuel chest (example NBT)
+     ["Warp"]    = 11,                                        -- anvil-rename the warp plate chest to this
+     ["Deposit"] = 14,                                        -- anvil-rename the deposit chest to this
+     ["Refuel"]  = 16,                                        -- anvil-rename the refuel chest to this
      ["mob_grinding_utils:absorption_hopper"] = 12,           -- vacuum hopper (item name)
      ["waystones:warp_plate"] = 13,                           -- warp plate (item name)
      ["advancedperipherals:geo_scanner"] = 15,                -- geo scanner (item name)
@@ -116,35 +124,52 @@ end
 
         -- Check if the peripheral was successfully wrapped.
         if chest then
-            local numSlots = 17 -- Standard chest inventory size (usually 27 for a single chest, 54 for double, but peripheral might report based on configured size)
+            -- turtle.suck() cannot be pointed at a chest slot: it always draws
+            -- from the chest's LOWEST-numbered non-empty slot. The original code
+            -- walked slots 2..17 in order and relied on the inspected slot and
+            -- the sucked slot staying in lockstep, which only held when every
+            -- staged item was a single item in one contiguous run starting at
+            -- slot 2. Re-reading the lowest occupied slot each pass drops that
+            -- assumption, and chest.list() means no hardcoded chest size either.
+            local guard = 0
+            while true do
+                guard = guard + 1
+                if guard > 128 then
+                    print("Staging guard tripped; stopping to avoid a spin.")
+                    break
+                end
 
-            for slotNum = 2, numSlots do
-                local itemDetails = chest.getItemDetail(slotNum)
+                local contents = chest.list()
+                local first = nil
+                for slot in pairs(contents) do
+                    if first == nil or slot < first then first = slot end
+                end
+                if first == nil then break end
+
+                local itemDetails = chest.getItemDetail(first)
+                local label, target = "?", nil
                 if itemDetails then
-                    local name = itemDetails.name
-                    local nbt = itemDetails.nbt
-                    -- Determine the target turtle slot based on item_mapping
-                    -- Prioritize mapping by exact item name, then by NBT if present
-                    print(name)
-                    if item_table[name] == nil and item_table[nbt] == nil then
-                        turtle.select(1)
-                        turtle.suck()
+                    label = itemDetails.displayName or itemDetails.name
+                    -- display name first, so the anvil-renamed chests beat the
+                    -- shared item id they all have; then item id; then NBT hash
+                    target = item_mapping[itemDetails.displayName]
+                          or item_mapping[itemDetails.name]
+                          or item_mapping[itemDetails.nbt]
+                end
+
+                if target ~= nil and target > 9 then
+                    print(string.format("chest %d: %s -> slot %d", first, label, target))
+                    turtle.select(target)
+                    if not turtle.suck(1) then
+                        print("Could not pull " .. label .. " into slot " .. target .. "; stopping.")
+                        break
                     end
-                    if item_table[name] ~= nil then
-                        print(name)
-                        if item_table[name] > 9 then
-                            print("name" .. name)
-                            turtle.select(item_table[name])
-                            turtle.suck(1)
-                        end
-                    end
-                    if item_table[nbt] ~= nil then
-                        print(nbt)
-                        if item_table[nbt] > 9 then
-                            print("nbt" .. nbt)
-                            turtle.select(item_table[nbt])
-                            turtle.suck(1)
-                        end
+                else
+                    print(string.format("chest %d: %s -> bulk", first, label))
+                    turtle.select(1)
+                    if not turtle.suck() then
+                        print("Turtle inventory full; stopping.")
+                        break
                     end
                 end
             end
@@ -332,7 +357,10 @@ end
 
 --actual code that runs on the bot
 digReady()
-runTurtleLogistics(my_item_table,my_vacuum_hopper_id)
+-- was runTurtleLogistics(my_item_table, ...) - my_item_table was never defined
+-- anywhere, so the mapping arrived nil and only worked because the function
+-- ignored its own parameter and read the global. It now uses the parameter.
+runTurtleLogistics(item_table,my_vacuum_hopper_id)
 scanReady()
 p = peripheral.wrap("left")
 refuel()
