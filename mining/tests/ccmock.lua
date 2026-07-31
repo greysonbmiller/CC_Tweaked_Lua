@@ -56,6 +56,7 @@ function M.makeEnv(opts)
     for k, v in pairs(opts.world or {}) do world[k] = v end
     local blocked = opts.blockedFaces or {}
     local contents = { front = {}, up = {}, down = {} }   -- what placed containers hold
+    local pendingWrap = {}    -- face -> wrap calls still to be answered with nil
     local files = {}
     for k, v in pairs(opts.preFiles or {}) do files[k] = v end
 
@@ -126,6 +127,7 @@ function M.makeEnv(opts)
         local it = inv[selected]
         if not it then return false end
         world[face] = it.name
+        pendingWrap[face] = opts.wrapDelay or 0
         if it.name == PLATE then report.platePlaced = true end
         contents[face] = {}
         it.count = it.count - 1
@@ -234,6 +236,14 @@ function M.makeEnv(opts)
             }
         end
         if world[side] and CONTAINERS[world[side]] then
+            -- A freshly placed block is not attached as a peripheral the instant
+            -- place() returns - the block entity has to come up and CC has to
+            -- notice it. wrapDelay models that: the first N wrap calls after a
+            -- placement see nothing, exactly as the real turtle does.
+            if pendingWrap[side] and pendingWrap[side] > 0 then
+                pendingWrap[side] = pendingWrap[side] - 1
+                return nil
+            end
             return { list = function() return {} end }
         end
         return nil

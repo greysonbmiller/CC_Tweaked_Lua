@@ -145,6 +145,11 @@ local LOOT_FIRST, LOOT_LAST = 1, 9
 -- server; not placing one costs only the rescue mechanism.
 local WARP_PLATE_ENABLED = false
 
+-- How long withContainer waits for a just-placed container to show up as a
+-- peripheral before believing it is not one. Five quarter-second retries.
+local WRAP_RETRIES     = 5
+local WRAP_RETRY_SLEEP = 0.25
+
 local PICKAXE = "minecraft:diamond_pickaxe"
 local SCANNER = "advancedperipherals:geo_scanner"
 local ENDER   = "enderstorage:ender_chest"
@@ -416,7 +421,25 @@ local function withContainer(slot, action, faces)
             notePlaced(slot, face)
             -- The confirmation that makes this whole file safe. Air wraps as
             -- nil, so there is no way to drop into nothing from here.
+            --
+            -- But a block that WAS just placed does not attach as a peripheral
+            -- the instant place() returns - the block entity has to come up and
+            -- CC has to notice it. Wrapping once and reading nil as "that is not
+            -- an inventory" dug perfectly good ender chests straight back up,
+            -- tried the next face, failed the same way, and reported "could not
+            -- place on any face" at a turtle with room all around it. On the
+            -- refuel path that failure calls distress(), so a timing hiccup
+            -- became a halted bot.
+            --
+            -- Since place() only succeeds here when OUR container went down, a
+            -- persistent nil means something is genuinely wrong; the retries
+            -- cost nothing in the normal case because the first wrap works.
             local inv = peripheral.wrap(face)
+            for _ = 1, WRAP_RETRIES do
+                if inv then break end
+                os.sleep(WRAP_RETRY_SLEEP)
+                inv = peripheral.wrap(face)
+            end
             if inv then
                 local ok = action(f, face, slot)
                 turtle.select(slot)
@@ -548,7 +571,13 @@ local function distress(what, why)
 
     local ok, plateFace, sent = pcall(deployWarpPoint)
     local msg
-    if ok and plateFace then
+    if not WARP_PLATE_ENABLED then
+        -- Do not say "I could not place a plate", which reads as a failure to
+        -- be investigated. Nothing was attempted: placing one crashes the
+        -- server, so the rescue mechanism is switched off on purpose.
+        msg = "Warp plates are OFF (placing one crashes the server), so I cannot " ..
+              "leave you a way to reach me. Note where I am."
+    elseif ok and plateFace then
         msg = sent
             and "Warp plate is DOWN and the warp stone is on its way to you - come and get me."
             or  "Warp plate is DOWN, but I could not send the warp stone home."

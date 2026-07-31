@@ -265,6 +265,26 @@ end
 assertThat("no warp plate placed in any scenario", not everPlaced,
            "placed during: " .. tostring(placedIn))
 
+-- 16. A placed block is not attached as a peripheral the instant place()
+--     returns: the block entity has to come up and CC has to notice it.
+--     withContainer wrapped immediately and treated nil as "that is not an
+--     inventory", so it dug a perfectly good ender chest back up, tried the next
+--     face, failed identically, and reported "could not place on any face" -
+--     while the operator was looking at a turtle with obvious room around it.
+--
+--     Refuel is where this hurts most: the failure path is distress(), so a
+--     timing hiccup turned into a halted bot.
+print("\n[16] a slow-to-attach peripheral must not read as 'no room'")
+r = run{ preInv = fullKit(), preFiles = { ["state.txt"] = st },
+         frontChest = nil, wrapDelay = 3, budget = 4000 }
+assertThat("did not give up on the refuel chest",
+           not (r.err or ""):find("Could not place the refuel chest", 1, true), r.err)
+assertThat("did not give up on the deposit chest",
+           not (r.err or ""):find("Could not place the deposit chest", 1, true), r.err)
+assertThat("kept mining rather than halting", r.budgetHit, r.err)
+assertThat("NOTHING dropped into the world", r.worldDrops == 0,
+           "worldDrops=" .. r.worldDrops)
+
 print("\n" .. string.rep("=", 64))
 print(string.format("%d passed, %d failed", pass, fail))
 if fail > 0 then os.exit(1) end
