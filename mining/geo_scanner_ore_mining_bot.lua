@@ -1326,10 +1326,7 @@ end
 ---
 --- Returns false having moved NOTHING if no face worked. Callers must treat
 --- that as "keep the items", never as "drop them anyway".
-local function withContainer(slot, action, faces)
-    faces = faces or FACE_ORDER
-    if turtle.getItemCount(slot) == 0 then return false end
-
+local function tryFaces(slot, action, faces)
     for _, face in ipairs(faces) do
         local f = FACE[face]
         -- Best effort, but gravel-aware: a single dig into a gravel column
@@ -1378,6 +1375,86 @@ local function withContainer(slot, action, faces)
     end
     turtle.select(1)
     return false
+end
+
+local function withContainer(slot, action, faces)
+    local defaultFaces = (faces == nil)
+    faces = faces or FACE_ORDER
+    if turtle.getItemCount(slot) == 0 then return false end
+
+    local ok, face = tryFaces(slot, action, faces)
+    if ok then return ok, face end
+
+    -- A caller that named its own faces meant it - warpPlate passes
+    -- {"up","down"} precisely so nothing digs up the plate it just placed - so
+    -- the fallback below is only for the default all-round attempt.
+    if not defaultFaces then return false end
+
+    -- BEHIND THE TURTLE, the last resort.
+    --
+    -- Front, up and down can all refuse at once, and not only for the obvious
+    -- reasons. A MineColonies claim denies block interaction outright: place()
+    -- simply returns false on every side while the turtle sits in what looks
+    -- like a perfectly open space. Lava, bedrock and gravel can do the same.
+    --
+    -- But the turtle has just WALKED OUT of the space behind it, so that block
+    -- is known to be air, and if it walked in from outside a claim it is often
+    -- outside the claim too. That makes "behind" the one face with evidence
+    -- behind it rather than hope.
+    --
+    -- FACING IS LOAD-BEARING. seek() converts world axes into turtle-relative
+    -- moves through state.facing, so a turtle that ends a cycle rotated walks
+    -- the wrong way for the entire rest of the run - the exact failure that
+    -- once looked like a broken scanner. The two turns are therefore undone on
+    -- EVERY path out of here, success or failure alike.
+    --
+    -- Note tryFaces records the placement as "front" in state.placed while we
+    -- are turned around. A crash in the narrow window before it is dug back up
+    -- would leave recoverPlacedBlocks looking one face off. That is a worse
+    -- trade only if crashes there are common; being unable to deposit at all is
+    -- certain, and this is the fix for it.
+    turtle.turnLeft()
+    turtle.turnLeft()
+    ok, face = tryFaces(slot, action, { "front" })
+    turtle.turnLeft()
+    turtle.turnLeft()
+    return ok, face
+end
+
+-- How often a stuck bot repeats itself. Often enough to notice, rarely enough
+-- that a long claim-blocked stretch is not a wall of chat.
+local STUCK_REPEAT_SECONDS = 120
+local lastStuckSay = nil
+
+local function nowSeconds()
+    -- os.epoch is CC-only; os.clock is the portable fallback and is fine here
+    -- because only the DIFFERENCE between two readings is ever used.
+    local ok, ms = pcall(os.epoch, "utc")
+    if ok and type(ms) == "number" then return ms / 1000 end
+    return os.clock()
+end
+
+--- Say "I am likely stuck", at most once every STUCK_REPEAT_SECONDS.
+---
+--- THIS DOES NOT STOP THE PROGRAM, and that is the entire point. The old
+--- behaviour on a blocked chest was distress(), which ends with error() and
+--- kills the run. A dead program cannot listen for chat, so it cannot be
+--- retargeted, cannot be told to change radius, and - the expensive one -
+--- cannot be told to $scuttle now. Staying alive and complaining keeps every
+--- remote option open; dying converts a temporary obstruction into a permanent
+--- loss of the whole turtle.
+---
+--- Being unable to deposit is also self-healing more often than not: the bot
+--- keeps mining, moves 15 blocks each cycle, and walks out of the claim or the
+--- lava field on its own.
+local function sayStuck(why)
+    local t = nowSeconds()
+    if lastStuckSay and (t - lastStuckSay) < STUCK_REPEAT_SECONDS then return end
+    lastStuckSay = t
+    print("LIKELY STUCK: " .. why)
+    pcall(chat, "I AM LIKELY STUCK - " .. why ..
+          " Still running and still mining, so I will keep trying. Say " ..
+          CHAT_PREFIX .. "scuttle now if you would rather I sent everything home.")
 end
 
 -- Failure at BASE. There is a player and a supply chest right here, so saying
@@ -1541,8 +1618,10 @@ local function deposit()
         return true
     end)
     if not ok then
-        distress("Could not place the deposit chest on any face.",
-                 "Holding the loot rather than throwing it away.")
+        sayStuck("I cannot put the deposit chest down on any side, or behind " ..
+                 "me. Something is refusing block placement - a claim, or lava, " ..
+                 "or bedrock all round. Holding the loot rather than throwing " ..
+                 "it away.")
     end
 
     -- THE CHEST CAN FILL UP. It is an ender chest drained into the ME system at
@@ -1631,8 +1710,9 @@ local function refuel()
         return true
     end)
     if not ok then
-        distress("Could not place the refuel chest on any face.",
-                 "Stopping with the fuel I have rather than pressing on.")
+        sayStuck("I cannot put the refuel chest down on any side, or behind " ..
+                 "me, so I cannot take on fuel here. Carrying on with what I " ..
+                 "have and trying again next cycle.")
     end
 
     fuel = turtle.getFuelLevel()
@@ -1654,10 +1734,18 @@ local function refuel()
         local isFull = type(tankSize) == "number" and fuel >= tankSize
         if fuel <= before and not isFull then
             -- The single most dangerous condition there is: still mobile now,
-            -- immobile shortly. Spend some of the remaining fuel putting a warp
-            -- point down while it can still be done.
-            distress(string.format("REFUEL FAILED - fuel stuck at %d.", fuel),
-                     "Stopping before I strand.")
+            -- immobile shortly.
+            --
+            -- This used to distress(), which ends in error() and kills the run.
+            -- That is precisely backwards. A bot that stops mining still has
+            -- fuel; a bot whose PROGRAM has stopped cannot be talked to at all,
+            -- so the one remaining way to save the kit - $scuttle now - dies
+            -- with it. Complaining every couple of minutes while still running
+            -- keeps that door open right up until the tank is empty.
+            sayStuck(string.format(
+                "REFUEL FAILED - fuel stuck at %d and not rising. The refuel " ..
+                "chest is empty, or what is in it will not burn. I will strand " ..
+                "when this runs out.", fuel))
         end
     end
     setPhase("mining")
