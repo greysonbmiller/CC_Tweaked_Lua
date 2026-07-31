@@ -350,6 +350,9 @@ function M.makeEnv(opts)
         end,
         time = function() return 0 end,
         clock = os.clock,
+        -- CC-only; not part of stock Lua's os table, so the probes would blow
+        -- up on a nil call without it.
+        epoch = function() return 0 end,
     }, { __index = os })
 
     local env = {
