@@ -62,7 +62,8 @@ function M.makeEnv(opts)
 
     local report = { worldDrops = 0, staged = false, budgetHit = false,
                      platePlaced = false, safeDrops = 0, world = world,
-                     scanCount = 0, sent = {}, writes = {}, ups = 0, downs = 0 }
+                     scanCount = 0, sent = {}, writes = {}, ups = 0, downs = 0,
+                     refuels = 0, ranDry = false, fuel = fuel, minFuel = fuel }
     local budget, steps = opts.budget or 4000, 0
     local function tick()
         steps = steps + 1
@@ -100,7 +101,21 @@ function M.makeEnv(opts)
     function turtle.getFuelLevel() return fuel end
     function turtle.getFuelLimit() return 20000 end
     function turtle.refuel()
+        report.refuels = report.refuels + 1
         if opts.fuelRises ~= false then fuel = fuel + 800 end
+        report.fuel = fuel
+        return true
+    end
+
+    -- Movement costs fuel only when a test asks for it. Off by default so that
+    -- scenarios about placement and restart are not perturbed by running dry;
+    -- on, it is what lets a test prove the bot cannot strand itself.
+    local function burn()
+        if not opts.burnFuel then return true end
+        if fuel <= 0 then report.ranDry = true; return false end
+        fuel = fuel - 1
+        report.fuel = fuel
+        if fuel < (report.minFuel or math.huge) then report.minFuel = fuel end
         return true
     end
 
@@ -187,13 +202,13 @@ function M.makeEnv(opts)
     turtle.inspect     = function() return inspectFace("front") end
     turtle.inspectUp   = function() return inspectFace("up")    end
     turtle.inspectDown = function() return inspectFace("down")  end
-    turtle.forward = function() tick() return true end
+    turtle.forward = function() tick() return burn() end
     -- ups/downs exist so a test can prove the bot actually went for an ore.
     -- seek() is the only thing that moves vertically by more than it comes
     -- back: the hopper pass is exactly one down and one up, so it nets to
     -- zero, and netUp > 0 means an upward seek and nothing else.
-    turtle.up = function() tick() report.ups = report.ups + 1 return true end
-    turtle.down = function() tick() report.downs = report.downs + 1 return true end
+    turtle.up = function() tick() report.ups = report.ups + 1 return burn() end
+    turtle.down = function() tick() report.downs = report.downs + 1 return burn() end
     turtle.turnLeft = function() tick() return true end
     turtle.turnRight = function() tick() return true end
 

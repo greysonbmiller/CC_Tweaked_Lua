@@ -221,6 +221,18 @@ r = run(base({ { msg = "ore is the best thing to mine" } }))
 assertThat("targets untouched", targets(r, LAPIS), stateOf(r))
 assertThat("stayed quiet", not saidAny(r, "I do not know"), allSaid(r))
 
+-- 16. A retargeting window on every start and every recovery. Without it the
+--     first chance to retask the bot is its first scheduled warp - four
+--     completed cycles away, and much longer in dense ore. A reboot is exactly
+--     when someone is most likely to be standing there wanting to change
+--     something, and exactly when the bot is about to walk off for an hour.
+print("\n[16] a retargeting window opens at startup")
+r = run{ preInv = fullKit(),
+         preFiles = { ["state.txt"] = warpingState(), ["ores.txt"] = CATALOGUE },
+         scans = {}, chats = { { msg = "$ore 4" } }, budget = 4000 }
+assertThat("announced that it was starting up", saidAny(r, "Starting up"), allSaid(r))
+assertThat("took a command before mining", targets(r, DIAMOND), stateOf(r))
+
 print("\n" .. string.rep("=", 64))
 print(string.format("%d passed, %d failed", pass, fail))
 if fail > 0 then os.exit(1) end

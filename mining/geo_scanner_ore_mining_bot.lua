@@ -58,6 +58,28 @@ local DEFAULT_TARGETS = {
 -- possibly get to it. warpPlate() runs every 4th cycle (see the main loop).
 local WARP_HOLD_SECONDS = 30
 
+-- HOW MANY MINISCANS MAY FOLLOW ONE WIDE SCAN
+--
+-- scan_loop() chases ore for as long as it keeps finding some. refuel(),
+-- deposit() and the warp announce all live AFTER scan_loop in the main loop, so
+-- a vein that never runs out meant none of them ever ran: the bot burned fuel
+-- seeking ore, filled its loot slots, went silent, and would eventually strand
+-- itself - all while apparently working perfectly. Measured against the real
+-- file: 3,999 scans, zero announces, zero refuels.
+--
+-- Targeting several common ores at once makes this far likelier than it was
+-- when the bot hunted a single rare ore, so the chain is now bounded.
+--
+-- Ore left behind is not lost. The next cycle's wide scan picks the vein back
+-- up, and the bot only moves 15 blocks between cycles.
+local MAX_MINISCANS = 25
+
+-- Below this, break out of a scan chain and refuel rather than chasing one more
+-- ore, so a rich vein cannot outrun the refuel schedule even within one bounded
+-- cycle. A full move() is 15 blocks and seeking costs more, so this leaves a
+-- wide margin over what a single cycle can burn.
+local FUEL_FLOOR = 500
+
 -- WARP PLATES ARE DISABLED. Do not turn this on without reading why.
 --
 -- Waystones' WaystoneBlockBase.setPlacedBy() syncs waystone data to whoever
@@ -722,18 +744,13 @@ end
 -- line an unbounded list would be a wall of chat. $ores has no such cap.
 local ANNOUNCE_VISIBLE_MAX = 8
 
+--- The part of an announce that is the same whoever opened the window: what is
+--- being mined, what is worth picking here, and how to pick it.
+---
 --- One ore per line throughout, matching $ores. Full ids rather than shortened
 --- ones now that each has a line to itself: the exact id is what you would
 --- retype, and abbreviating it was only ever a way to fit several on a row.
-local function announceWindow(send, sent, hasPlate)
-    if hasPlate then
-        send(string.format("Warp plate is down%s - %d seconds to collect me.",
-                           sent and " and the warp stone is on its way to you" or "",
-                           WARP_HOLD_SECONDS))
-    else
-        send(string.format("Listening for %d seconds.", WARP_HOLD_SECONDS))
-    end
-
+local function announceMenu(send)
     send("Mining:")
     for _, id in ipairs(state.targets) do
         send("  " .. id)
@@ -759,15 +776,16 @@ local function announceWindow(send, sent, hasPlate)
                        CHAT_PREFIX, CHAT_PREFIX, #catalogue))
 end
 
---- Hold the warp point open, listening for commands the whole time.
+--- Open a listening window: announce, then take commands until the time is up.
 ---
 --- os.sleep() CANNOT be used here. It is implemented as pull-events-until-my-
 --- timer, and os.pullEvent(filter) discards everything that does not match, so
 --- every chat message arriving during the hold would be pulled off the queue
 --- and thrown away. The window would look right and hear nothing.
-local function warpWindow(sent, hasPlate)
+local function listenWindow(headline)
     local listened = withChatBox(function(send)
-        announceWindow(send, sent, hasPlate)
+        send(headline)
+        announceMenu(send)
         local deadline = os.startTimer(WARP_HOLD_SECONDS)
         while true do
             local event, a, b = os.pullEvent()
@@ -1035,6 +1053,15 @@ local function deposit()
     setPhase("mining")
 end
 
+--- Is fuel low enough to stop what we are doing and go and get some?
+---
+--- getFuelLevel() returns the STRING "unlimited" when fuel is disabled
+--- server-side, so this must not compare numerically without checking.
+local function lowFuel()
+    local f = turtle.getFuelLevel()
+    return type(f) == "number" and f < FUEL_FLOOR
+end
+
 local function refuel()
     digReady()
     setPhase("refueling")
@@ -1106,7 +1133,13 @@ local function warpPlate()
     -- disabled the only chance to retarget the bot as well - a config flag on
     -- one feature quietly switching off an unrelated one.
     print("pausing functionality - listening for commands")
-    warpWindow(sent, plateFace ~= nil)
+    if plateFace then
+        listenWindow(string.format("Warp plate is down%s - %d seconds to collect me.",
+                                   sent and " and the warp stone is on its way to you" or "",
+                                   WARP_HOLD_SECONDS))
+    else
+        listenWindow(string.format("Listening for %d seconds.", WARP_HOLD_SECONDS))
+    end
     print("resuming functionality")
 
     if plateFace then recoverWarpPlate(plateFace) end
@@ -1362,12 +1395,26 @@ local function scan_and_search(radius)
     end
 end
 
+--- One wide scan, then a BOUNDED chain of miniscans following the vein.
+---
+--- The bound is what guarantees the cycle completes. Everything that keeps the
+--- bot alive and reachable - refuel, deposit, the warp announce - runs after
+--- this function returns, so an unbounded chase silently disabled all three.
 local function scan_loop()
     local success = scan_and_search(8)
     print("full scan")
-    while success ~= nil do
+    local n = 0
+    while success ~= nil and n < MAX_MINISCANS do
+        if lowFuel() then
+            print("fuel low - ending the scan chain to go and refuel")
+            break
+        end
         success = scan_and_search(3)
-        print("miniscan")
+        n = n + 1
+        print("miniscan " .. n)
+    end
+    if n >= MAX_MINISCANS then
+        print("miniscan limit reached - completing the cycle")
     end
 end
 
@@ -1417,9 +1464,29 @@ end
 scanReady()
 refuel()
 
+-- Always offer a retargeting window before going back to work, on a first run
+-- and on every recovery alike.
+--
+-- Without this the first chance to retask the bot is its first scheduled warp,
+-- which is four completed cycles away and can be much longer in dense ore. A
+-- reboot is exactly when you are most likely to be standing there wanting to
+-- change something, and exactly when the bot is about to walk off for an hour.
+--
+-- Deliberately after refuel(): a full tank first, then conversation.
+listenWindow(string.format(
+    "Starting up%s. Listening %d seconds - retarget me now if you want to.",
+    state.deployed and " again" or "", WARP_HOLD_SECONDS))
+
 while true do
-    if state.cycles > 3 then
+    -- Refuel on the schedule OR whenever fuel is low, whichever comes first.
+    -- Tying refuelling to the warp schedule alone meant a hungry cycle had to
+    -- wait up to four more cycles for a top-up; the bot can burn a lot of fuel
+    -- in four cycles of chasing ore.
+    local due = state.cycles > 3
+    if due or lowFuel() then
         refuel()
+    end
+    if due then
         warpPlate()
         state.cycles = 0
     end

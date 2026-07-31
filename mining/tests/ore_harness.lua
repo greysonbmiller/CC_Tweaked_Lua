@@ -174,6 +174,36 @@ assertThat("targets both lapis variants by default",
 assertThat("and goes for lapis without being told", (r.ups - r.downs) >= 3,
            "ups=" .. r.ups .. " downs=" .. r.downs)
 
+-- 9. DENSE ORE MUST NOT STARVE THE CYCLE.
+--
+--    scan_loop miniscans for as long as it keeps finding ore. refuel(),
+--    deposit() and the warp announce all live AFTER it in the main loop, so a
+--    vein that never runs out meant none of them ever ran: the bot burned fuel
+--    seeking ore, filled its loot slots, went silent, and would eventually
+--    strand itself - while apparently working perfectly.
+--
+--    Measured before the fix: 3,999 scans, zero announces, zero refuels.
+--
+--    Selecting several common ores at once makes this far more likely, so it
+--    matters more now than when the bot hunted one rare ore.
+print("\n[9] endless ore must not starve refuel or the announce")
+local endless = {}
+for i = 1, 4000 do endless[i] = { block(LAPIS, 0, 1, 0) } end
+r = run{ preInv = fullKit(),
+         preFiles = { ["state.txt"] = deployedState({ LAPIS }) },
+         scans = endless, burnFuel = true, budget = 12000 }
+local announces = 0
+for _, m in ipairs(r.sent) do
+    local msg = tostring(m.msg)
+    if msg:find("Warp plate is down", 1, true) or msg:find("Listening for", 1, true) then
+        announces = announces + 1
+    end
+end
+assertThat("still refuelled", r.refuels > 0, "refuels=" .. r.refuels)
+assertThat("never ran out of fuel", not r.ranDry,
+           "minFuel=" .. tostring(r.minFuel))
+assertThat("still announced", announces > 0, "announces=" .. announces)
+
 print("\n" .. string.rep("=", 64))
 print(string.format("%d passed, %d failed", pass, fail))
 if fail > 0 then os.exit(1) end
