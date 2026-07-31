@@ -15,6 +15,13 @@
 reference_ore = "minecraft:deepslate_lapis_ore"
 reference2 = "minecraft:lapis_ore"
 
+-- How long warpPlate() leaves the warp plate on the ground for you to reach it.
+-- The announcement text is built from this number, so the two can never drift
+-- apart again - previously the bot said "30 seconds" while the pause itself was
+-- commented out, so the plate was down for about two seconds and you could not
+-- possibly get to it. warpPlate() runs every 4th cycle (see the main loop).
+local WARP_HOLD_SECONDS = 30
+
 -- Staging map: what the turtle pulls out of the chest in front of it, and which
 -- slot each thing goes to. Keys are matched against an item's display name
 -- first, then its item id, then its NBT hash.
@@ -279,10 +286,13 @@ local function warpPlate()
     turtle.select(11) --chest for the activated warp stone
     turtle.placeUp()  -- put down the activated warp stone chest up
     for i=1,9 do turtle.select(i) turtle.dropUp() end -- put all the items (including warp stone) into chest
-    chat("You have 30 seconds to come collect the bot...")
+    -- Everything is now on the ground: warp plate in front, ender chest above.
+    -- Hold that arrangement for real. The old code announced 30 seconds and then
+    -- immediately tore it down, because both the countdown and the io.read()
+    -- pause below it were commented out.
+    chat(string.format("Warp plate is down - you have %d seconds to come collect the bot...", WARP_HOLD_SECONDS))
     print("pausing functionality")
-    --for i=1,30 do chat(tostring(30-i)) os.sleep(0.5) end
-    --local input = io.read() -- Wait for user input
+    os.sleep(WARP_HOLD_SECONDS)
     print("resuming functionality")
     chat("The bot has resumed!")
     turtle.select(13) --select warp plate slot
