@@ -390,25 +390,10 @@ local function recordScan(scan_data)
     return grew
 end
 
--- "minecraft:deepslate_lapis_ore" -> "deepslate_lapis_ore". Chat lines are
--- short and the namespace is the same for every entry in a listing, so it is
--- noise; the full id is still what gets stored and matched.
-local function shortName(id)
-    return (id:match(":(.+)$") or id)
-end
-
---- What the bot is currently mining, as a chat-length phrase.
-local function targetSummary()
-    local parts = {}
-    for i, id in ipairs(state.targets) do
-        if i > 3 then
-            parts[#parts + 1] = string.format("+%d more", #state.targets - 3)
-            break
-        end
-        parts[#parts + 1] = shortName(id)
-    end
-    return #parts > 0 and table.concat(parts, ", ") or "nothing"
-end
+-- Names were once shortened to "deepslate_lapis_ore" so several would fit on a
+-- chat row. Everything is one-per-line now, so the full id is always printed:
+-- it is the exact string you would retype, and abbreviating it only ever served
+-- the packing that no longer happens.
 
 --- Ores from the most recent scan that have a pick number, most useful first.
 --- These are the ones within reach of where the bot is standing right now,
@@ -732,14 +717,26 @@ local function handleCommand(who, message, send)
     return true
 end
 
+-- At most this many visible ores are offered in an announce. The announce fires
+-- every fourth cycle whether or not anyone is reading it, and with one ore per
+-- line an unbounded list would be a wall of chat. $ores has no such cap.
+local ANNOUNCE_VISIBLE_MAX = 8
+
+--- One ore per line throughout, matching $ores. Full ids rather than shortened
+--- ones now that each has a line to itself: the exact id is what you would
+--- retype, and abbreviating it was only ever a way to fit several on a row.
 local function announceWindow(send, sent, hasPlate)
     if hasPlate then
-        send(string.format("Warp plate is down%s - %d seconds to collect me. Mining: %s.",
+        send(string.format("Warp plate is down%s - %d seconds to collect me.",
                            sent and " and the warp stone is on its way to you" or "",
-                           WARP_HOLD_SECONDS, targetSummary()))
+                           WARP_HOLD_SECONDS))
     else
-        send(string.format("Listening for %d seconds. Mining: %s.",
-                           WARP_HOLD_SECONDS, targetSummary()))
+        send(string.format("Listening for %d seconds.", WARP_HOLD_SECONDS))
+    end
+
+    send("Mining:")
+    for _, id in ipairs(state.targets) do
+        send("  " .. id)
     end
     if not ANNOUNCE_MENU then return end
 
@@ -748,12 +745,15 @@ local function announceWindow(send, sent, hasPlate)
     -- behind $ores.
     local vis = visibleOres()
     if #vis > 0 then
-        local parts = {}
+        send("Visible here:")
         for i, v in ipairs(vis) do
-            if i > 6 then break end
-            parts[#parts + 1] = string.format("%d %s", v.n, shortName(v.id))
+            if i > ANNOUNCE_VISIBLE_MAX then
+                send(string.format("  ...and %d more, say %sores",
+                                   #vis - ANNOUNCE_VISIBLE_MAX, CHAT_PREFIX))
+                break
+            end
+            send(string.format("  %d  %s", v.n, v.id))
         end
-        send("Visible here: " .. table.concat(parts, "  |  "))
     end
     send(string.format("Pick with %sore <numbers> - %sores lists all %d I have found.",
                        CHAT_PREFIX, CHAT_PREFIX, #catalogue))

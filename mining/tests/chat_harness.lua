@@ -135,6 +135,18 @@ print("\n[8] the announce states the target and how to change it")
 r = run(base({}))
 assertThat("named what it is mining", saidAny(r, "lapis"), allSaid(r))
 assertThat("advertised the command", saidAny(r, "$ore"), allSaid(r))
+-- One selected ore per line, matching $ores. Both targets must appear, and no
+-- single message may carry more than one id.
+assertThat("listed both selected ores",
+           saidAny(r, LAPIS) and saidAny(r, LAPIS_DEEP), allSaid(r))
+local packed = nil
+for _, m in ipairs(r.sent) do
+    local n = 0
+    for _ in tostring(m.msg):gmatch("[%w_%-%.]+:[%w_%-%./]+") do n = n + 1 end
+    if n > 1 then packed = tostring(m.msg) end
+end
+assertThat("no announce line carries two ores", packed == nil,
+           "packed line: " .. tostring(packed))
 
 -- 9. The window must end on its own and give the plate back. Not "no plate is
 --    on the ground at the end" - the run is cut at an arbitrary point and may
