@@ -69,7 +69,8 @@ function M.makeEnv(opts)
                      platePlaced = false, safeDrops = 0, world = world,
                      scanCount = 0, sent = {}, writes = {}, ups = 0, downs = 0,
                      refuels = 0, ranDry = false, fuel = fuel, minFuel = fuel,
-                     scanRadii = {}, cooldownMisses = 0 }
+                     scanRadii = {}, cooldownMisses = 0,
+                     turns = 0, turnLeft = 0, turnRight = 0 }
     local budget, steps = opts.budget or 4000, 0
     local function tick()
         steps = steps + 1
@@ -249,8 +250,16 @@ function M.makeEnv(opts)
     -- zero, and netUp > 0 means an upward seek and nothing else.
     turtle.up = function() tick() report.ups = report.ups + 1 return burn() end
     turtle.down = function() tick() report.downs = report.downs + 1 return burn() end
-    turtle.turnLeft = function() tick() return true end
-    turtle.turnRight = function() tick() return true end
+    -- Turn counts expose which way seek() decided to go, which is the only
+    -- outward sign that its world-axis to turtle-relative conversion is right.
+    turtle.turnLeft = function()
+        tick(); report.turns = report.turns + 1; report.turnLeft = report.turnLeft + 1
+        return true
+    end
+    turtle.turnRight = function()
+        tick(); report.turns = report.turns + 1; report.turnRight = report.turnRight + 1
+        return true
+    end
 
     -- Successive scan results. Each scan() call consumes the next entry; once
     -- they run out the scanner sees nothing, which is what stops a test run

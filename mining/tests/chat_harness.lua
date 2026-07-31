@@ -288,6 +288,41 @@ assertThat("kept chasing at close to full rate", (r.ups - r.downs) >= 1000,
            "netUp=" .. (r.ups - r.downs) .. " (no-rejection baseline is ~1646," ..
            " give-up-on-nil is ~303) misses=" .. tostring(r.cooldownMisses))
 
+-- 21. FACING. The scanner reports offsets in WORLD axes; seek() steers by
+--     turning relative to the turtle. Converting one to the other is only
+--     possible if the bot knows which way it faces, and the original code
+--     silently assumed north. Set down facing south, every move went the wrong
+--     way - the bot walked directly away from ore it had correctly detected,
+--     which reads as "the scanner is broken".
+--
+--     An ore three blocks SOUTH: facing north that is behind the turtle and
+--     needs a 180, facing south it is straight ahead and needs no turn at all.
+local function seekTurns(facing)
+    local oreSouth = {}
+    for i = 1, 60 do oreSouth[i] = { { name = REDSTONE, x = 0, y = 0, z = 3 } } end
+    local rr = run{ preInv = fullKit(),
+                    preFiles = { ["state.txt"] =
+                        '{["deployed"]=true,["phase"]="mining",["cycles"]=0,' ..
+                        '["placed"]={},["facing"]="' .. facing .. '",' ..
+                        '["targets"]={"' .. REDSTONE .. '",},}' },
+                    scans = oreSouth, budget = 900 }
+    return rr.turns
+end
+
+print("\n[21] seek respects the turtle's facing")
+local turnsNorth, turnsSouth = seekTurns("north"), seekTurns("south")
+assertThat("facing south needs fewer turns than facing north",
+           turnsSouth < turnsNorth,
+           "north=" .. turnsNorth .. " south=" .. turnsSouth)
+
+print("\n[22] $facing sets it, and refuses nonsense")
+r = run(base({ { msg = "$facing east" } }))
+assertThat("recorded the facing", stateOf(r):find("east", 1, true) ~= nil, stateOf(r))
+r = run(base({ { msg = "$facing sideways" } }))
+assertThat("refused a non-direction",
+           stateOf(r):find("sideways", 1, true) == nil, stateOf(r))
+assertThat("listed the valid directions", saidAny(r, "north"), allSaid(r))
+
 print("\n" .. string.rep("=", 64))
 print(string.format("%d passed, %d failed", pass, fail))
 if fail > 0 then os.exit(1) end

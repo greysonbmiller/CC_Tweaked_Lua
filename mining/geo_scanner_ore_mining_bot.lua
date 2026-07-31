@@ -13,6 +13,23 @@
 -- while the relevant peripheral is stowed is lost, not queued.
 --
 --
+-- WHICH WAY IS THE TURTLE FACING?
+--
+-- Set it down facing NORTH, or tell it otherwise with "$facing south" - it
+-- cannot work this out for itself without GPS.
+--
+-- The geo scanner reports offsets in WORLD axes: x is east, z is south, no
+-- matter which way the turtle points. seek() travels by turning relative to the
+-- turtle, so it has to convert one into the other, and that conversion depends
+-- entirely on the facing. Get it wrong and the bot walks AWAY from ore it has
+-- correctly detected - the scan works, the maths works, and the turtle mines
+-- empty stone in the wrong direction. There is no error, nothing in the log,
+-- and it looks for all the world like a broken scanner.
+--
+-- Facing is preserved once running: seek always turns back the way it came and
+-- move() never turns. Only the starting orientation matters.
+--
+--
 -- TWO RULES THIS FILE IS BUILT AROUND
 --
 -- 1. NOTHING IS EVER DROPPED INTO THE WORLD.
@@ -256,8 +273,40 @@ local WRAP_RETRY_SLEEP = 0.25
 -- radius   : the wide-scan radius. Persisted for the same reason, and because
 --            reverting it silently would change the bot's fuel burn by orders
 --            of magnitude without anyone noticing.
+-- facing   : which way the turtle was pointing when it was set down. See
+--            worldToTurtle() for why this is load-bearing.
 local state = { deployed = false, phase = "startup", cycles = 0, placed = {},
-                targets = {}, radius = DEFAULT_RADIUS }
+                targets = {}, radius = DEFAULT_RADIUS, facing = "north" }
+
+local FACINGS = { north = true, east = true, south = true, west = true }
+
+--- Convert a scanner offset into "how far ahead" and "how far to my right".
+---
+--- THE SCANNER REPORTS WORLD AXES. x is east, z is south, always, whichever way
+--- the turtle happens to be pointing. seek() steers by turning relative to the
+--- turtle, so the two only line up if the bot knows its facing.
+---
+--- The original code did this conversion for north and north only, without
+--- saying so. Set the turtle down facing south and every move went the wrong
+--- way: it walked directly AWAY from ore it had correctly detected, which from
+--- outside looks exactly like a broken scanner.
+---
+--- Facing is preserved across a run - seek always turns back the way it came,
+--- and move() never turns - so only the starting orientation matters.
+local function worldToTurtle(x, z, facing)
+    if facing == "east"  then return  x,  z end   -- ahead = +x, right = +z
+    if facing == "south" then return  z, -x end   -- ahead = +z, right = -x
+    if facing == "west"  then return -x, -z end   -- ahead = -x, right = -z
+    return -z, x                                  -- north: ahead = -z, right = +x
+end
+
+local function setFacing(dir)
+    if type(dir) ~= "string" then return nil end
+    dir = dir:lower()
+    if not FACINGS[dir] then return nil end
+    state.facing = dir
+    return dir
+end
 
 -- What a scan of each radius costs in fuel, read from the scanner itself at
 -- startup rather than hardcoded, because it is pack-configurable. Empty until
@@ -402,6 +451,7 @@ local function loadState()
     state.placed   = type(data.placed) == "table" and data.placed or {}
     setTargets(type(data.targets) == "table" and data.targets or DEFAULT_TARGETS)
     if not setRadius(data.radius) then setRadius(DEFAULT_RADIUS) end
+    if not setFacing(data.facing) then setFacing("north") end
     return true
 end
 
@@ -825,7 +875,18 @@ local function handleCommand(who, message, send)
     if not verb then return false end
     verb = verb:lower()
 
-    if verb == "radius" then
+    if verb == "facing" then
+        if rest == "" then
+            send(string.format("I think I am facing %s. %sfacing <north|east|south|west>.",
+                               state.facing, CHAT_PREFIX))
+        elseif setFacing(rest:match("^(%S+)")) then
+            saveState()
+            send(string.format("Facing set to %s. If I was walking away from ore, " ..
+                               "that was why.", state.facing))
+        else
+            send("I only know north, east, south and west.")
+        end
+    elseif verb == "radius" then
         if rest == "" then
             reportRadius(send)
         else
@@ -905,6 +966,11 @@ local function announceMenu(send)
     send(string.format("Scan radius %d (%s) - %sradius <n> to change, max %d.",
                        state.radius, costPhrase(state.radius),
                        CHAT_PREFIX, SCAN_RADIUS_MAX))
+    -- Stated every window on purpose. A wrong facing has no error and no log
+    -- line - the bot simply mines away from everything - so the only defence is
+    -- saying out loud what it believes, where someone can notice it is wrong.
+    send(string.format("Facing %s - %sfacing <dir> if that is wrong.",
+                       state.facing, CHAT_PREFIX))
 end
 
 --- Open a listening window: announce, then take commands until the time is up.
@@ -1492,22 +1558,33 @@ end
 -- Scanning and seeking
 ----------------------------------------------------------------------------
 
+--- Travel to a scanner offset.
+---
+--- The offset arrives in WORLD axes, so it is converted to "ahead" and "to my
+--- right" first. With facing = north this produces exactly the moves the
+--- original code made; with any other facing it produces the correct ones
+--- rather than the north ones.
+---
+--- Every turn is undone before returning, so the bot's facing is the same
+--- afterwards as before and state.facing stays true for the whole run.
 local function seek(x,y,z)
-    if x > 0 then
+    local ahead, right = worldToTurtle(x, z, state.facing)
+
+    if right > 0 then
         turtle.turnRight()
-        move(math.abs(x))
+        move(math.abs(right))
         turtle.turnLeft()
-    elseif x < 0 then
+    elseif right < 0 then
         turtle.turnLeft()
-        move(math.abs(x))
+        move(math.abs(right))
         turtle.turnRight()
     end
-    if z < 0 then
-        move(math.abs(z))
-    elseif z > 0 then
+    if ahead > 0 then
+        move(math.abs(ahead))
+    elseif ahead < 0 then
         turtle.turnRight()
         turtle.turnRight()
-        move(math.abs(z))
+        move(math.abs(ahead))
         turtle.turnLeft()
         turtle.turnLeft()
     end
