@@ -25,6 +25,10 @@ M.CHATBOX   = "advancedperipherals:chat_box"
 M.PLATE     = "waystones:warp_plate"
 M.HOPPER    = "mob_grinding_utils:absorption_hopper"
 M.PICKAXE   = "minecraft:diamond_pickaxe"
+-- The right-arm chunk loader. Reserved permanently in the real bot - the only
+-- thing keeping its chunk loaded while it works thousands of blocks from any
+-- player - so it needs its own identity here the same way PICKAXE/SCANNER do.
+M.CHUNKY    = "advancedperipherals:chunky_turtle"
 
 M.CONTAINERS = { [M.ENDER] = true, ["minecraft:chest"] = true }
 
@@ -41,20 +45,36 @@ function M.fullKit()
     }
 end
 
--- opts: preInv, preFiles, world, worldNbt, blockedFaces, frontChest, budget,
---       fuelRises, scans, chats, player
+-- opts: preInv, preFiles, world, worldNbt, blockedFaces, blockFacesAfterChat,
+--       frontChest, budget, fuelRises, scans, chats, player, rightTool,
+--       rightArmSticks
 function M.makeEnv(opts)
     local SCANNER, CHATBOX = M.SCANNER, M.CHATBOX
     local PLATE, PICKAXE, CONTAINERS = M.PLATE, M.PICKAXE, M.CONTAINERS
+    local CHUNKY = M.CHUNKY
 
     local inv = {}
     for s, it in pairs(opts.preInv or {}) do inv[s] = { name = it.name, count = it.count or 1,
                                                         nbt = it.nbt, displayName = it.displayName } end
     local selected, leftTool = 1, PICKAXE
+    -- The chunk loader sits on the right arm from the moment the turtle is
+    -- deployed - unlike the left arm, nothing time-shares this slot. Defaults
+    -- to the real chunk loader but is swappable via opts.rightTool so a test
+    -- can model whatever is actually on the arm.
+    local rightTool = opts.rightTool or CHUNKY
     local fuel = 500
     local world = {}
     for k, v in pairs(opts.world or {}) do world[k] = v end
     local blocked = opts.blockedFaces or {}
+    -- Normally `blocked` applies from the very first tick. But some scenarios
+    -- need the WORLD to be fine at startup and only become impassable later -
+    -- e.g. "the turtle has wandered somewhere walled in by bedrock or lava by
+    -- the time it is scuttled". opts.blockFacesAfterChat defers activation
+    -- until the first chat event is actually delivered (see pullEvent below),
+    -- so the ordinary startup sequence - including the always-runs refuel()
+    -- - completes normally, and only a placement attempted AFTER a chat
+    -- command has been heard runs into the blocked faces.
+    local blockingActive = not opts.blockFacesAfterChat
     local contents = { front = {}, up = {}, down = {} }   -- what placed containers hold
     local pendingWrap = {}    -- face -> wrap calls still to be answered with nil
     -- NBT of blocks WE placed, so digging one back up returns the same item.
@@ -67,10 +87,32 @@ function M.makeEnv(opts)
 
     local report = { worldDrops = 0, staged = false, budgetHit = false,
                      platePlaced = false, safeDrops = 0, world = world,
+                     -- `contents` is the same table the mock mutates internally
+                     -- (see placeFace/dropFace below), exposed by reference so a
+                     -- test can inspect what actually landed in a placed
+                     -- container without reaching into the mock's closure.
+                     contents = contents,
                      scanCount = 0, sent = {}, writes = {}, ups = 0, downs = 0,
                      refuels = 0, ranDry = false, fuel = fuel, minFuel = fuel,
                      scanRadii = {}, cooldownMisses = 0,
-                     turns = 0, turnLeft = 0, turnRight = 0 }
+                     turns = 0, turnLeft = 0, turnRight = 0,
+                     shutdown = false,
+                     -- Every sendMessageToPlayer call that found the chat box
+                     -- already swapped off the left arm - see the CHATBOX
+                     -- branch of wrap() below. A message going missing is
+                     -- invisible by itself (report.sent just has one fewer
+                     -- entry, same as if nothing had ever tried to send it);
+                     -- this is what lets a test assert the stronger, more
+                     -- useful claim "the code TRIED to talk with the box off
+                     -- the arm", instead of only noticing an absence.
+                     detachedSends = 0,
+                     -- One ordered log of everything notable the mock saw,
+                     -- appended to as it happens rather than reconstructed
+                     -- afterwards. This is what lets a test assert ORDER - e.g.
+                     -- "nothing at all happens between equipRight() and the
+                     -- loader's drop()" - without every scenario having to
+                     -- invent its own bespoke tracking.
+                     eventLog = {} }
     local budget, steps = opts.budget or 4000, 0
     local function tick()
         steps = steps + 1
@@ -81,7 +123,14 @@ function M.makeEnv(opts)
     local supply = opts.frontChest
 
     local turtle = {}
-    function turtle.select(s) selected = s return true end
+    function turtle.select(s)
+        selected = s
+        -- Logged unconditionally, same as every other event below - which
+        -- slot was selected right before an equip/drop/place is exactly what
+        -- lets a test reconstruct WHAT moved, not just that something did.
+        report.eventLog[#report.eventLog + 1] = "select:" .. tostring(s)
+        return true
+    end
     function turtle.getItemCount(s)
         local it = inv[s or selected]; return it and it.count or 0
     end
@@ -103,6 +152,24 @@ function M.makeEnv(opts)
         local held = inv[selected]
         inv[selected] = leftTool and { name = leftTool, count = 1 } or nil
         leftTool = held and held.name or nil
+        report.eventLog[#report.eventLog + 1] = "equipLeft"
+        return true
+    end
+    -- RIGHT ARM: the chunk loader, permanently reserved. Same swap semantics
+    -- as equipLeft on purpose - whatever the production code ends up doing to
+    -- take it off is going to be the identical "select a slot, swap with the
+    -- arm" pattern, since that is the only equip primitive CC exposes.
+    --
+    -- opts.rightArmSticks models the one failure this arm actually needs to
+    -- survive: a chunk loader that will not come off. It has to be a no-op
+    -- that returns false, not an error, because the real API call behaves
+    -- the same way when an unequip is refused.
+    function turtle.equipRight()
+        if opts.rightArmSticks then return false end
+        local held = inv[selected]
+        inv[selected] = rightTool and { name = rightTool, count = 1 } or nil
+        rightTool = held and held.name or nil
+        report.eventLog[#report.eventLog + 1] = "equipRight"
         return true
     end
     function turtle.getFuelLevel() return fuel end
@@ -148,6 +215,9 @@ function M.makeEnv(opts)
 
     local function digFace(face)
         tick()
+        -- Logged before the outcome is known, same as a real dig attempt: the
+        -- turtle swings whether or not there is a block there.
+        report.eventLog[#report.eventLog + 1] = "dig"
         if not world[face] then return false end
         -- Digging a container spills whatever is inside onto the ground.
         for _ in pairs(contents[face]) do end
@@ -169,11 +239,14 @@ function M.makeEnv(opts)
     end
     local function placeFace(face)
         tick()
-        if blocked[face] then return false end
+        if blockingActive and blocked[face] then return false end
         if world[face] then return false end
         local it = inv[selected]
         if not it then return false end
         world[face] = it.name
+        -- Only on an actual placement - a blocked or already-occupied face
+        -- moved nothing, so there is nothing worth putting in the log.
+        report.eventLog[#report.eventLog + 1] = "place:" .. it.name
         placedNbt[face] = it.nbt
         pendingWrap[face] = opts.wrapDelay or 0
         if it.name == PLATE then report.platePlaced = true end
@@ -194,6 +267,11 @@ function M.makeEnv(opts)
         tick()
         local it = inv[selected]
         if not it then return false end
+        -- Every drop, whatever its destination - this is deliberately logged
+        -- before the safe/world branch below so a test can see EVERY item
+        -- that left the turtle in the exact order it left, not just the ones
+        -- that landed safely.
+        report.eventLog[#report.eventLog + 1] = "drop:" .. it.name
         if world[face] and CONTAINERS[world[face]] then
             table.insert(contents[face], it)      -- landed safely
             report.safeDrops = report.safeDrops + it.count
@@ -307,7 +385,29 @@ function M.makeEnv(opts)
                     end,
                 }
             elseif leftTool == CHATBOX then
+                -- The left arm has exactly one slot shared between pickaxe,
+                -- geo scanner and chat box - unlike the permanently-reserved
+                -- right arm, nothing here sits still. A caller that wraps the
+                -- chat box once and holds onto the returned handle across a
+                -- later digReady()/scanReady() is trusting that the box is
+                -- still what's mounted - and on real hardware it usually
+                -- isn't, because either of those swaps it straight off the
+                -- arm. CC does not let a detached peripheral's methods
+                -- silently no-op: they throw "Terminated: peripheral
+                -- detached". The old version of this branch was a bare
+                -- closure over `report` that never looked at leftTool again,
+                -- so it went on recording "sent" messages forever - which let
+                -- a test watch a chat message "succeed" that the player could
+                -- never actually have received in game. Re-checking leftTool
+                -- HERE, inside the returned function rather than in wrap()
+                -- itself, is what makes the handle behave like the real
+                -- stale one: wrap() ran once and returned a snapshot, but the
+                -- arm keeps moving underneath it.
                 return { sendMessageToPlayer = function(msg, who)
+                    if leftTool ~= CHATBOX then
+                        report.detachedSends = report.detachedSends + 1
+                        error("Terminated: peripheral detached", 0)
+                    end
                     report.sent[#report.sent + 1] = { msg = msg, who = who }
                     -- Models the chat box refusing when the recipient is not
                     -- logged in, which for an unattended bot is most of the time.
@@ -347,6 +447,12 @@ function M.makeEnv(opts)
             if leftTool == CHATBOX then return CHATBOX end
             return nil
         end
+        -- The right arm only ever carries the chunk loader (or nothing, once
+        -- scuttle takes it off), so there is only one thing to report.
+        if side == "right" then
+            if rightTool == CHUNKY then return CHUNKY end
+            return nil
+        end
         return nil
     end
 
@@ -375,7 +481,10 @@ function M.makeEnv(opts)
     }
     local fsmock = {
         exists = function(p) return files[p] ~= nil end,
-        delete = function(p) files[p] = nil end,
+        delete = function(p)
+            files[p] = nil
+            report.eventLog[#report.eventLog + 1] = "delete:" .. p
+        end,
         move = function(a, b) files[b] = files[a]; files[a] = nil end,
         open = function(p, mode)
             if mode == "r" then
@@ -418,6 +527,12 @@ function M.makeEnv(opts)
             -- exactly as the real peripheral behaves.
             if leftTool == CHATBOX and #pending > 0 and (not filter or filter == "chat") then
                 local c = table.remove(pending, 1)
+                -- The deferred-blocking trigger: the world only turns hostile
+                -- once a chat command has actually been heard, so a scenario
+                -- can prove "the abort path runs when placement fails AFTER
+                -- the command arrives" without that same blockage killing the
+                -- unrelated startup refuel() first.
+                blockingActive = true
                 return "chat", c.who or opts.player or "SKAAAAL", c.msg, "uuid", true
             end
             -- Once the queue drains, keep handing back the most recent timer id
@@ -427,6 +542,16 @@ function M.makeEnv(opts)
             return "timer", t or nextTimer
         end,
         time = function() return 0 end,
+        -- The real os.shutdown() never returns: the computer just goes dark
+        -- mid-chunk. Modelled as a special error so it unwinds the whole
+        -- program exactly like the budget guard's "__BUDGET__" does, but
+        -- M.run below treats THIS one as a CLEAN finish rather than a run
+        -- that had to be cut off - shutting down mid-scuttle is success.
+        shutdown = function()
+            report.shutdown = true
+            report.eventLog[#report.eventLog + 1] = "shutdown"
+            error("__SHUTDOWN__", 0)
+        end,
         clock = os.clock,
         -- CC-only; not part of stock Lua's os table, so the probes would blow
         -- up on a nil call without it.
@@ -461,6 +586,11 @@ function M.run(target, opts)
     local env, report, files, inv = M.makeEnv(opts)
     setfenv(chunk, env)
     local ok, err = pcall(chunk)
+    -- os.shutdown() unwinds the chunk via the same error() mechanism the
+    -- budget guard uses, but it means the opposite thing: the program ended
+    -- itself on purpose, so this must read as success, not as a run that ran
+    -- out of budget.
+    if not ok and err == "__SHUTDOWN__" then ok = true end
     report.ok, report.err = ok, tostring(err)
     report.files, report.inv = files, inv
     return report

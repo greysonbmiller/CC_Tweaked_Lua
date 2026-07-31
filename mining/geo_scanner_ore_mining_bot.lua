@@ -235,6 +235,7 @@ local LOOT_FIRST, LOOT_LAST = 1, 9
 
 local PICKAXE = "minecraft:diamond_pickaxe"
 local SCANNER = "advancedperipherals:geo_scanner"
+local CHATBOX = "advancedperipherals:chat_box"
 local ENDER   = "enderstorage:ender_chest"
 local PLATE   = "waystones:warp_plate"
 local HOPPER  = "mob_grinding_utils:absorption_hopper"
@@ -747,6 +748,20 @@ local CHAT_PREFIX = "$"        -- AdvancedPeripherals' hidden-message prefix:
 -- fourth cycle adds up if you are not using it; set false for the single line.
 local ANNOUNCE_MENU = true
 
+-- SCUTTLING: the deliberate, irreversible abandonment of the whole kit.
+--
+-- Thousands of blocks from any player, with no way to warp back and no way to
+-- be found, a turtle that has wandered off the edge of what anyone can reach
+-- is worth less than the kit riding inside it. Scuttling ships everything of
+-- value home through the Deposit ender chest - which teleports its contents
+-- into the ME system from any distance - then powers the turtle off for good.
+-- The shell and the one placed ender chest are a known, deliberate sacrifice.
+--
+-- Set true only once scuttle() has actually done its work, and read only from
+-- listenWindow() - see the comment at the end of scuttle() for why
+-- os.shutdown() is called from there and not from inside scuttle() itself.
+local scuttled = false
+
 --- Resolve one token of a $ore command to a block id.
 --- A number indexes the catalogue. Anything containing a namespace colon is
 --- taken literally, which is the escape hatch for an ore the bot has not
@@ -862,6 +877,171 @@ local function looksLikePick(token)
        and (tonumber(token) ~= nil or token:find(":", 1, true) ~= nil)
 end
 
+--- Abandon the kit for good: ship everything home through the deposit chest,
+--- then power off. Only ever invoked by handleCommand's "scuttle now" branch,
+--- and only after the PLAYER-only check at the top of handleCommand.
+---
+--- Deliberately NOT built on withContainer(): withContainer's contract is
+--- place -> use -> dig the container back up, which is exactly wrong here.
+--- The deposit chest has to stay in the world to receive the chunk loader in
+--- step 8 below, and by then there is no pickaxe left on the arm to recover it
+--- with anyway. This places the chest and leaves it standing, re-implementing
+--- withContainer's retry/wrap confirmation rather than calling it.
+local function scuttle(send)
+    -- 1. Goodbye FIRST, while the chat box is still on the arm and still in
+    --    the inventory. Whatever goes wrong after this line, at least this
+    --    much got said.
+    send("Scuttling now - sending everything home through the deposit chest, " ..
+         "then powering off for good. Goodbye.")
+
+    -- 2. Pickaxe on, so the faces ahead can actually be cleared.
+    digReady()
+
+    -- 3. Place the deposit chest and LEAVE IT STANDING. Same face order and
+    --    the same WRAP_RETRIES confirmation loop as withContainer - a block
+    --    that was JUST placed does not attach as a peripheral the instant
+    --    place() returns - but no dig() at the end: this chest is not coming
+    --    back up.
+    local face, f
+    if turtle.getItemCount(SLOT.deposit) > 0 then
+        for _, candidate in ipairs(FACE_ORDER) do
+            local cf = FACE[candidate]
+            cf.dig()                        -- best effort; failure is fine
+            turtle.select(SLOT.deposit)
+            if cf.place() then
+                notePlaced(SLOT.deposit, candidate)
+                local wrapped = peripheral.wrap(candidate)
+                for _ = 1, WRAP_RETRIES do
+                    if wrapped then break end
+                    os.sleep(WRAP_RETRY_SLEEP)
+                    wrapped = peripheral.wrap(candidate)
+                end
+                if wrapped then
+                    face, f = candidate, cf
+                    break
+                end
+                -- Placed something that never wrapped as an inventory. Take it
+                -- straight back rather than leaving it down or, worse,
+                -- dropping into it next.
+                turtle.select(SLOT.deposit)
+                cf.dig()
+                noteRemoved(candidate)
+            end
+        end
+    end
+
+    if not face then
+        -- ABORT SAFETY. Scattering the kit on the floor thousands of blocks
+        -- from home is far worse than simply not scuttling: nothing has moved
+        -- yet, so nothing is at risk. Say so and stop here.
+        turtle.select(1)
+
+        -- `send` (the parameter above) is DEAD by this point and must NOT be
+        -- used. It closes over the chat box handle withChatBox wrap()'d
+        -- before scuttle() ever ran - but step 2's digReady() has since
+        -- swapped the chat box off the one arm slot shared with the pickaxe
+        -- and the scanner, to make room for the pickaxe. On real hardware a
+        -- detached peripheral's methods do not go quiet, they THROW, and
+        -- that throw lands inside send's own pcall (see withChatBox), so the
+        -- call would not error - it would just say nothing. A silent
+        -- "$scuttle now" reads as success, when the truth is the opposite:
+        -- the whole kit is still sitting out here and nothing has moved.
+        -- This is the trap for whoever adds the next message after a tool
+        -- swap and reaches for the `send` already in scope.
+        --
+        -- So: swap the chat box back onto the arm and wrap "left" again,
+        -- FRESH, rather than trust the stale handle - mirrors withChatBox's
+        -- own equip-and-wrap exactly. Nothing has been dropped yet, so the
+        -- chat box is still findable and equipLeft(CHATBOX) puts it on.
+        --
+        -- Deliberately NOT swapped back to the pickaxe afterwards. This
+        -- abort path returns to normal mining, and it is withChatBox's own
+        -- restore (turtle.select(SLOT.chat); turtle.equipLeft()), running
+        -- once this whole command - and the rest of the listen window - is
+        -- done, that puts the pickaxe back on the arm and the chat box back
+        -- into SLOT.chat. Swapping back here too would cancel that restore
+        -- out and leave the chat box on the arm, pickaxe stranded, at the
+        -- exact moment mining is supposed to resume.
+        if equipLeft(CHATBOX) then
+            os.sleep(1)
+            local box = peripheral.wrap("left")
+            if box and box.sendMessageToPlayer then
+                pcall(box.sendMessageToPlayer,
+                      "I cannot scuttle - the deposit chest will not place on any " ..
+                      "face near me. Keeping everything; nothing has moved.", PLAYER)
+            end
+        end
+        return
+    end
+
+    -- 4. Loot home.
+    for i = LOOT_FIRST, LOOT_LAST do
+        if turtle.getItemCount(i) > 0 then
+            turtle.select(i)
+            f.drop()
+        end
+    end
+
+    -- 5. The rest of the kit: chat box, warp chest, refuel chest, hopper,
+    --    plate, and whichever tool is currently parked in SLOT.tool (normally
+    --    the scanner - the pickaxe is on the arm and leaves in the next step).
+    for _, slot in ipairs({ SLOT.chat, SLOT.warp, SLOT.hopper, SLOT.plate, SLOT.refuel, SLOT.tool }) do
+        if turtle.getItemCount(slot) > 0 then
+            turtle.select(slot)
+            f.drop()
+        end
+    end
+
+    -- 6. The pickaxe itself, off the left arm and into the chest.
+    local spare = firstEmptySlot()
+    if spare then
+        turtle.select(spare)
+        turtle.equipLeft()
+        f.drop()
+    end
+
+    -- 7. THE KILL SWITCH. Delete startup.lua and the state file BEFORE the
+    --    chunk loader ever comes off the right arm (step 8 below). If the
+    --    turtle freezes mid-step-8 and someone finds it years from now, it
+    --    must sit inert rather than relaunch on the next boot and try to mine
+    --    with no tools left.
+    if fs.exists("startup.lua") then fs.delete("startup.lua") end
+    if fs.exists(STATE_FILE) then fs.delete(STATE_FILE) end
+
+    -- 8. THE RACE INVARIANT - the single most important sequence in this
+    --    file. The chunk loader on the right arm is the ONLY thing keeping
+    --    this chunk loaded thousands of blocks from any player. The instant
+    --    equipRight() takes it off, the chunk becomes eligible to unload,
+    --    which freezes this program wherever it happens to be running. If
+    --    that freeze lands in the gap between "off the arm" and "safely in
+    --    the chest", the loader is stuck inside a frozen turtle at
+    --    coordinates nobody will ever find, and nothing will ever load that
+    --    chunk again to let it finish.
+    --
+    --    So there is NOTHING between equipRight() and drop() below: the
+    --    destination slot is selected FIRST, and equipRight()'s return value
+    --    is deliberately not even inspected - reading it would put a branch
+    --    in the one gap that must not have one. If the arm will not release
+    --    (a stuck arm), drop() simply finds the selected slot empty and is a
+    --    safe no-op; every other piece of the kit is already delivered by
+    --    this point regardless.
+    local loaderSlot = firstEmptySlot()
+    if loaderSlot then turtle.select(loaderSlot) end
+    turtle.equipRight()
+    f.drop()
+
+    -- 9. os.shutdown() is deliberately NOT called here. This function runs
+    --    from deep inside listenWindow's chat loop, itself wrapped in the
+    --    pcall inside withChatBox that exists so one failed chat send can
+    --    never bring the run down. On real hardware os.shutdown() never gives
+    --    control back either way - but letting THAT pcall catch it would
+    --    (wrongly) let this program carry on afterwards, kit gone but still
+    --    trying to mine with no pickaxe. So this only marks the request;
+    --    listenWindow() calls os.shutdown() itself, once, from outside every
+    --    pcall on the stack.
+    scuttled = true
+end
+
 local function handleCommand(who, message, send)
     if type(who) ~= "string" or type(message) ~= "string" then return false end
     if who:lower() ~= PLAYER:lower() then return false end
@@ -918,6 +1098,21 @@ local function handleCommand(who, message, send)
             selectOres(rest, send)
         else
             return false
+        end
+    elseif verb == "scuttle" then
+        -- AdvancedPeripherals strips the $ before the event ever reaches this
+        -- file (see the big comment above looksLikePick), so a bare "scuttle"
+        -- typed in ordinary conversation is indistinguishable from a
+        -- deliberate "$scuttle". Scuttling is irreversible, so "scuttle"
+        -- alone can NEVER be enough to fire it - only the literal
+        -- confirmation "now" does; everything else, prefixed or not, only
+        -- warns.
+        if rest:lower() == "now" then
+            scuttle(send)
+        else
+            send("Scuttling throws away the whole kit for good, and I cannot " ..
+                 "tell an accidental word from a real order. If you mean it, " ..
+                 "say scuttle now.")
         end
     elseif prefixed then
         send(string.format("I only understand %sore, %sores and %sradius.",
@@ -995,14 +1190,26 @@ local function listenWindow(headline)
                 -- hear you" from "the bot heard you and rejected it".
                 print(string.format("chat [%s]: %s", tostring(a), tostring(b)))
                 handleCommand(a, b, send)
+                -- Scuttling ends the conversation, not just this command: no
+                -- more chat is read, and the ordinary "resumed" message below
+                -- must never go out - there is nothing left to resume.
+                if scuttled then break end
             end
         end
-        send("The bot has resumed!")
+        if not scuttled then send("The bot has resumed!") end
     end)
 
     -- No chat box, or it would not equip. The hold still has to happen: someone
     -- may be walking towards the plate right now.
     if not listened then os.sleep(WARP_HOLD_SECONDS) end
+
+    -- THE ONLY SAFE PLACE TO CALL os.shutdown() FOR A SCUTTLE REQUEST. See the
+    -- comment at the end of scuttle() for why it cannot call this itself: that
+    -- function runs inside withChatBox's pcall, above, and a shutdown caught
+    -- by an inner pcall would wrongly let this program carry on. Here, after
+    -- withChatBox has already returned, nothing left on the call stack above
+    -- this point is a pcall, so the shutdown genuinely ends the run.
+    if scuttled then os.shutdown() end
 end
 
 -- Drive the left arm back to a known state after a restart. Whatever the bot
