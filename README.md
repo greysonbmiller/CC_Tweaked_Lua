@@ -2,20 +2,20 @@
 
 ComputerCraft / CC:Tweaked programs written for Minecraft turtles and computers, recovered from a decade of worlds (oldest file 2013, newest 2025) and sorted by what they do.
 
-`154` files: `109` runnable programs plus scratch experiments, boot shims and audio assets. Everything here actually ran in a world at some point.
+`167` files: `119` runnable programs plus scratch experiments, boot shims and audio assets. Everything here actually ran in a world at some point.
 
 
 ## Layout
 
 | Directory | Files | What's in it |
 |---|--:|---|
-| [`mining/`](mining/) | 28 | Quarries, tunnels, ore scanners and block harvesters. |
+| [`mining/`](mining/) | 39 | Quarries, tunnels, ore scanners and block harvesters. |
 | [`farming/`](farming/) | 19 | Crop, tree and resource farms that run unattended. |
 | [`fuel/`](fuel/) | 8 | Refuelling loops - lava buckets, bulk refuel, fuel monitoring. |
 | [`inventory/`](inventory/) | 15 | Sorting, counting, and moving items between chests and turtles. |
 | [`mobs/`](mobs/) | 6 | Mob farms, attack loops, drop collection. |
 | [`crafting/`](crafting/) | 3 | Turtle crafting loops and alloy/ESS automation. |
-| [`remote_control/`](remote_control/) | 17 | Driving a turtle from elsewhere - wireless modems, item signals, player detectors. |
+| [`remote_control/`](remote_control/) | 19 | Driving a turtle from elsewhere - wireless modems, item signals, player detectors. |
 | [`audio/`](audio/) | 10 | DFPWM playback on a speaker, plus the PC-side encoder and the audio assets. |
 | [`lib/`](lib/) | 3 | Reusable helpers loaded by other programs. |
 | [`tools/`](tools/) | 2 | PC-side helpers and one-off utilities. |
@@ -32,6 +32,7 @@ ComputerCraft / CC:Tweaked programs written for Minecraft turtles and computers,
 | [`dig_movement_api.lua`](third_party/flexico64/dig_movement_api.lua) | 34.2 KB | Full-featured turtle movement/mining API tracking position, auto-refueling, block blacklisting, and save/load state. |
 | [`base64_dfpwm_music_player.lua`](audio/base64_dfpwm_music_player.lua) | 16.8 KB | Decodes an embedded Base64 DFPWM audio blob and streams it to a speaker peripheral. |
 | [`quarry_full_no_gps.lua`](mining/quarry_full_no_gps.lua) | 14.7 KB | Full square quarry to bedrock with lava/water handling, hole-filling, auto-refuel, and deposit; no GPS. |
+| [`geo_scanner_generic_ore_miner.lua`](mining/geo_scanner_generic_ore_miner.lua) | 13.6 KB | Standalone geo-scanner ore miner: scans a radius, walks to each hit nearest-first, mines it, and returns home to dump when full. Not tied to one modpack's ore ids. |
 | [`allthemodium_ore_scanner_miner.lua`](mining/allthemodium_ore_scanner_miner.lua) | 12.4 KB | Full mining bot: geo-scans for allthemodium ore, navigates to it, warps out a full inventory via a waystone plate, and refuels. |
 | [`flex_utility_library.lua`](third_party/flexico64/flex_utility_library.lua) | 12.3 KB | General-purpose helper API: colored/multicolor printing, modem broadcast+log, inventory condense, block/item inspection helpers. |
 | [`geo_scanner_ore_mining_bot.lua`](mining/geo_scanner_ore_mining_bot.lua) | 12.1 KB | Geo Scanner ore bot: finds nearest lapis ore, mines it, loops, and periodically warps home via warp plate. |
